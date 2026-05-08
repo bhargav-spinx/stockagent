@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+.env.*
+!env.example.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# Cache files
+angel_scrip_master.json
+*.log
+logs/
+
+# IDE / OS
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
