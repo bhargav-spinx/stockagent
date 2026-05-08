@@ -5,12 +5,27 @@ Run: python bot.py
 
 import os
 import logging
+
+# Local dev: corp TLS inspection breaks cert verification for `requests`
+# (used by Angel One SDK, ipify, yfinance scrip-master download). Force every
+# Session created anywhere in the process to skip verification, and silence
+# the resulting urllib3 warning. Do NOT ship this to prod.
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+_orig_session_init = requests.Session.__init__
+def _patched_session_init(self, *a, **kw):
+    _orig_session_init(self, *a, **kw)
+    self.verify = False
+requests.Session.__init__ = _patched_session_init
+
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from telegram.request import HTTPXRequest
 
 from analyzer import analyze, format_report, normalize_symbol
 from data_provider import force_angel_login, angel_session_active, get_provider_name
@@ -274,7 +289,17 @@ def main():
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env file")
 
-    app = Application.builder().token(TOKEN).build()
+    # Local dev: corp SSL inspection breaks cert verification. Disable verify on
+    # the httpx client used by python-telegram-bot. Do NOT ship this to prod.
+    req = HTTPXRequest(httpx_kwargs={"verify": False})
+    get_updates_req = HTTPXRequest(httpx_kwargs={"verify": False})
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(req)
+        .get_updates_request(get_updates_req)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))

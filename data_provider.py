@@ -65,7 +65,11 @@ def _angel_login():
     if missing:
         raise RuntimeError(f"Angel One creds missing: {', '.join(missing)}")
 
-    smart = SmartConnect(api_key=api_key)
+    # disable_ssl=True is a local-dev workaround for corp TLS inspection.
+    # SmartConnect's _postRequest passes verify=not self.disable_ssl directly,
+    # overriding any requests.Session-level patch.
+    disable_ssl = os.getenv("ANGEL_DISABLE_SSL", "").lower() in ("1", "true", "yes")
+    smart = SmartConnect(api_key=api_key, disable_ssl=disable_ssl)
     totp = pyotp.TOTP(totp_secret).now()
     resp = smart.generateSession(client_code, password, totp)
     if not resp.get("status"):
