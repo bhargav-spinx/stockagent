@@ -6,20 +6,25 @@ Run: python bot.py
 import os
 import logging
 
-# Local dev: corp TLS inspection breaks cert verification for `requests`
-# (used by Angel One SDK, ipify, yfinance scrip-master download). Force every
-# Session created anywhere in the process to skip verification, and silence
-# the resulting urllib3 warning. Do NOT ship this to prod.
-import requests
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-_orig_session_init = requests.Session.__init__
-def _patched_session_init(self, *a, **kw):
-    _orig_session_init(self, *a, **kw)
-    self.verify = False
-requests.Session.__init__ = _patched_session_init
-
 from dotenv import load_dotenv
+
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DISABLE_SSL_VERIFY = os.getenv("DISABLE_SSL_VERIFY", "").lower() in ("1", "true", "yes")
+
+# Local-dev escape hatch for corp TLS inspection. Patches `requests.Session`
+# so Angel SDK / ipify / scrip-master downloads skip verification.
+# Activated only when DISABLE_SSL_VERIFY=true. Do NOT enable in production.
+if DISABLE_SSL_VERIFY:
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _orig_session_init = requests.Session.__init__
+    def _patched_session_init(self, *a, **kw):
+        _orig_session_init(self, *a, **kw)
+        self.verify = False
+    requests.Session.__init__ = _patched_session_init
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -29,9 +34,6 @@ from telegram.request import HTTPXRequest
 
 from analyzer import analyze, format_report, normalize_symbol
 from data_provider import force_angel_login, angel_session_active, get_provider_name
-
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -289,17 +291,16 @@ def main():
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env file")
 
-    # Local dev: corp SSL inspection breaks cert verification. Disable verify on
-    # the httpx client used by python-telegram-bot. Do NOT ship this to prod.
-    req = HTTPXRequest(httpx_kwargs={"verify": False})
-    get_updates_req = HTTPXRequest(httpx_kwargs={"verify": False})
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .request(req)
-        .get_updates_request(get_updates_req)
-        .build()
-    )
+    builder = Application.builder().token(TOKEN)
+
+    # Local-dev: skip TLS verification for python-telegram-bot's httpx client
+    # when behind a corp SSL-inspecting proxy. Only when DISABLE_SSL_VERIFY=true.
+    if DISABLE_SSL_VERIFY:
+        req = HTTPXRequest(httpx_kwargs={"verify": False})
+        get_updates_req = HTTPXRequest(httpx_kwargs={"verify": False})
+        builder = builder.request(req).get_updates_request(get_updates_req)
+
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
@@ -315,8 +316,25 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    logger.info("Bot starting...")
-    app.run_polling()
+    # Webhook mode (Cloud Run / any HTTPS host) when WEBHOOK_URL is set.
+    # PORT comes from the platform; defaults to 8080 (Cloud Run convention).
+    # WEBHOOK_SECRET is the URL path segment + Telegram secret_token — keeps
+    # randoms from spamming the endpoint.
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        port = int(os.getenv("PORT", "8080"))
+        secret = os.getenv("WEBHOOK_SECRET", "tg-webhook")
+        logger.info("Bot starting in webhook mode on port %d", port)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=secret,
+            secret_token=secret,
+            webhook_url=f"{webhook_url.rstrip('/')}/{secret}",
+        )
+    else:
+        logger.info("Bot starting in polling mode")
+        app.run_polling()
 
 
 if __name__ == "__main__":
