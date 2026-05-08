@@ -19,6 +19,10 @@ angel_scrip_master.json
 *.log
 logs/
 
+# Runtime SQLite (subscribers, fired-signal dedup) — per-deployment state
+stockagent.db
+*.db-journal
+
 # IDE / OS
 .claude/
 .vscode/
