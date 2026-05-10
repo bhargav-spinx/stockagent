@@ -57,21 +57,28 @@ def _signed_pct(entry: float, exit_price: float, direction: str) -> float:
     return (entry - exit_price) / entry * 100
 
 
-def resolve_intraday(alert: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve an intraday alert by checking 5-min candles after generation."""
+def resolve_intraday(alert: dict[str, Any],
+                     df: pd.DataFrame | None = None) -> dict[str, Any] | None:
+    """
+    Resolve an intraday alert by checking 5-min candles after generation.
+
+    If `df` is provided, use it (backtest mode — pre-fetched history slice).
+    Otherwise fetch the last 5 days from data_provider (live EOD mode).
+    """
     symbol = alert["symbol"]
     entry = alert["entry"]
     sl = alert["stop_loss"]
     t1 = alert["target1"]
     t2 = alert["target2"]
     direction = alert["direction"]
-    gen_time = _parse_iso(alert["generated_at"])
+    gen_time = _parse_iso(alert["generated_at"]) if isinstance(alert["generated_at"], str) else alert["generated_at"]
 
-    try:
-        df = fetch_data(symbol, period="5d", interval="5m")
-    except Exception as e:
-        logger.warning("resolve_intraday %s: data fetch failed: %s", symbol, e)
-        return {"status": "no_data"}
+    if df is None:
+        try:
+            df = fetch_data(symbol, period="5d", interval="5m")
+        except Exception as e:
+            logger.warning("resolve_intraday %s: data fetch failed: %s", symbol, e)
+            return {"status": "no_data"}
 
     if df.index.tz is None:
         df = df.tz_localize(IST)
