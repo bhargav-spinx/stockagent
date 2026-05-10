@@ -39,9 +39,12 @@ from telegram.request import HTTPXRequest
 
 from analyzer import analyze, format_report, normalize_symbol
 from data_provider import force_angel_login, angel_session_active, get_provider_name
-from scanner import scan_many, format_signal_telegram, TIER1_WATCHLIST
+from scanner import scan_many, format_signal_telegram, SCAN_PACING_SEC, TIER1_WATCHLIST
+from scanner_filters import is_intraday_entry_window
+from universe import INTRADAY_UNIVERSE, SWING_UNIVERSE
 import subscriptions
 import eod_report
+from eod_report import COST_PER_TRADE_PCT
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -75,13 +78,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/swing_alerts on` — end-of-day BUY/SELL alerts (15:45 IST, your watchlist)\n"
         "`/eod_report on` — daily summary of alerts + outcomes (15:35 IST)\n"
         "/today — on-demand EOD report right now\n"
+        "/universe — show stocks scanned by alerts\n"
         "/watch SYMBOL — add to watchlist\n"
         "/unwatch SYMBOL — remove from watchlist\n"
         "/mywatch — swing-analyze entire watchlist\n"
         "`/angel_status` — show data source & session status\n"
         "`/angel_login` — force a fresh Angel One login\n"
         "/help — show this message\n\n"
-        "💡 *Tip:* tap the `/` icon below to see all commands in a tap-to-pick menu.\n\n"
+        "💡 *Tip:* tap the `/` icon below to see all commands in a tap-to-pick menu.\n"
+        "🆕 New here? Send `/guide` for an interactive walkthrough with examples.\n\n"
         "_Use NSE tickers (RELIANCE, TCS, INFY) — `.NS` is added automatically._\n"
         "_For BSE, append `.BO` (e.g. `RELIANCE.BO`)._\n\n"
         "⚠️ *Educational tool only. Yahoo data is ~15 min delayed. "
@@ -124,16 +129,12 @@ async def _full_analysis(update: Update, symbol: str, mode: str):
         await update.message.reply_text(f"❌ Error: {e}")
 
 
-async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: `/analyze RELIANCE`", parse_mode="Markdown")
-        return
-    await _full_analysis(update, context.args[0], mode="swing")
-
-
 async def swing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for both /swing and /analyze (alias)."""
     if not context.args:
-        await update.message.reply_text("Usage: `/swing RELIANCE`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage: `/swing RELIANCE`", parse_mode="Markdown"
+        )
         return
     await _full_analysis(update, context.args[0], mode="swing")
 
@@ -345,6 +346,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscriptions.add_to_watchlist(user_id, sym)
         await query.message.reply_text(f"✅ Added {sym} to watchlist.")
 
+    elif action == "guide":
+        section = parts[1] if len(parts) > 1 else "menu"
+        if section not in GUIDE_SECTIONS:
+            section = "menu"
+        text, buttons = GUIDE_SECTIONS[section]
+        try:
+            await query.edit_message_text(
+                text, parse_mode="Markdown",
+                reply_markup=_guide_keyboard(buttons),
+            )
+        except Exception as e:
+            # Telegram errors if the new text is identical — ignore
+            logger.debug("guide edit failed: %s", e)
+
 
 # ---------- Plain text handler (treat any message as symbol) ----------
 
@@ -387,11 +402,12 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if arg == "on":
         subscriptions.subscribe(user_id)
         await update.message.reply_text(
-            "✅ Auto-scan alerts *ON*.\n\n"
-            "I'll scan the tier-1 watchlist every 5 minutes during NSE hours "
-            "(09:30–14:30 IST, excluding 12:00–13:30 lunch) and ping you when a setup fires.\n\n"
-            "Same setup on same stock won't be re-sent the same day (dedup).\n"
-            "`/scan_alerts off` to stop.",
+            f"✅ Auto-scan alerts *ON*.\n\n"
+            f"I'll scan {len(INTRADAY_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks "
+            f"every 5 minutes during NSE hours (09:30–14:30 IST, excluding "
+            f"12:00–13:30 lunch) and ping you when a setup fires.\n\n"
+            f"Same setup on same stock won't be re-sent the same day (dedup).\n"
+            f"`/scan_alerts off` to stop.",
             parse_mode="Markdown",
         )
     else:
@@ -399,22 +415,9 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔕 Auto-scan alerts *OFF*.", parse_mode="Markdown")
 
 
-def is_market_active(now: datetime | None = None) -> bool:
-    """NSE intraday entry window per STRATEGY.md §5: 09:30–14:30, no lunch (12:00–13:30)."""
-    now = now or datetime.now(IST)
-    if now.weekday() >= 5:  # Sat/Sun
-        return False
-    t = now.time()
-    if t < dt_time(9, 30) or t >= dt_time(14, 30):
-        return False
-    if dt_time(12, 0) <= t < dt_time(13, 30):
-        return False
-    return True
-
-
 async def _autoscan_tick(app: Application) -> None:
     """One pass of the auto-scan loop. Safe to call any time; no-ops outside market hours."""
-    if not is_market_active():
+    if not is_intraday_entry_window():
         return
 
     subs = subscriptions.get_subscribers()
@@ -422,9 +425,9 @@ async def _autoscan_tick(app: Application) -> None:
         return
 
     logger.info("autoscan: scanning %d symbols for %d subscriber(s)",
-                len(TIER1_WATCHLIST), len(subs))
+                len(INTRADAY_UNIVERSE), len(subs))
     try:
-        results = await asyncio.to_thread(scan_many, TIER1_WATCHLIST)
+        results = await asyncio.to_thread(scan_many, INTRADAY_UNIVERSE)
     except Exception as e:
         logger.exception("autoscan: scan_many crashed: %s", e)
         return
@@ -512,18 +515,271 @@ async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "✅ Swing alerts *ON*.\n\n"
             "Every trading day around 15:45 IST (after market close), "
-            "I'll run swing analysis on your watchlist and send BUY/SELL signals "
-            "with entry, stop-loss, and targets.\n"
+            "I'll run swing analysis and send BUY/SELL signals with entry, "
+            "stop-loss, and targets.\n"
             "_HOLD signals are silenced — only actionable BUY/SELL trigger an alert._\n\n"
         )
         if wl_count == 0:
-            msg += "⚠️ Your watchlist is empty — add stocks via `/watch RELIANCE` first."
+            msg += (
+                f"📋 *No watchlist set* — defaulting to NIFTY 100 + Bank NIFTY "
+                f"({len(SWING_UNIVERSE)} stocks).\n"
+                f"Add stocks via `/watch SYMBOL` to scan only those instead."
+            )
         else:
             msg += f"📋 Currently watching {wl_count} stock(s)."
         await update.message.reply_text(msg, parse_mode="Markdown")
     else:
         subscriptions.swing_unsubscribe(user_id)
         await update.message.reply_text("🔕 Swing alerts *OFF*.", parse_mode="Markdown")
+
+
+# ---------- Interactive guide ----------
+
+# Each section: (text, list of (button-label, callback-data)).
+# Callback prefix "guide:<section>" — handled in button_handler.
+GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "menu": (
+        "📚 *Bot Guide*\n\n"
+        "I'm your stock-signal assistant for NSE/BSE.\n"
+        "Pick a topic to read more — tap any button below.\n\n"
+        "_If anything is unclear after reading, message support._",
+        [
+            ("🚀 Quickstart (start here)", "guide:quickstart"),
+            ("🟦 Intraday alerts", "guide:intraday"),
+            ("🟪 Swing alerts", "guide:swing"),
+            ("📊 Reports", "guide:reports"),
+            ("🎯 Reading a signal", "guide:signal"),
+            ("🔄 A day with the bot", "guide:day"),
+            ("⚠️ Risk + disclaimers", "guide:risk"),
+        ],
+    ),
+    "quickstart": (
+        "🚀 *Quickstart — get alerts in 30 seconds*\n\n"
+        "Send these 3 commands to me, one at a time:\n\n"
+        "1️⃣ `/scan_alerts on`\n"
+        "      → intraday auto-alerts during market hours\n\n"
+        "2️⃣ `/swing_alerts on`\n"
+        "      → end-of-day BUY/SELL signals at 3:45 PM IST\n\n"
+        "3️⃣ `/eod_report on`\n"
+        "      → daily summary at 3:35 PM IST\n\n"
+        "That's it.\n\n"
+        "*Tomorrow during NSE hours (9:30 AM – 2:30 PM IST):*\n"
+        "• Auto intraday alerts when setups fire\n"
+        "• Daily summary at 3:35 PM\n"
+        "• Swing signals at 3:45 PM\n\n"
+        "To stop any alert: send the same command with `off`.\n"
+        "Example: `/scan_alerts off`",
+        [("← Back to menu", "guide:menu")],
+    ),
+    "intraday": (
+        "🟦 *Intraday Alerts (`/scan_alerts`)*\n\n"
+        "*What it does:*\n"
+        f"Bot scans {len(INTRADAY_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks every "
+        "5 min during market hours. Pings you when a high-confluence setup fires.\n\n"
+        "*Example signal:*\n"
+        "```\n"
+        "🔔 Auto-Signal\n"
+        "📈 Setup A — RELIANCE.NS  🟢 LONG\n"
+        "🎯 Entry: ₹1,247.50\n"
+        "🛑 SL:    ₹1,235.20  (-0.99%)\n"
+        "🥇 T1:    ₹1,260.00  RR 1:1.02\n"
+        "🥈 T2:    ₹1,272.50  RR 1:2.03\n"
+        "Confluences:\n"
+        "• Price > VWAP\n"
+        "• EMA9 > EMA20\n"
+        "• RSI 62 in 55–70 zone\n"
+        "```\n\n"
+        "*What you do:*\n"
+        "1. Open broker (Zerodha/Angel)\n"
+        "2. Place a bracket order at Entry\n"
+        "3. Set SL + targets at the prices shown\n"
+        "4. Sell 50% at T1, 50% at T2\n"
+        "5. After T1 hits: move SL to entry (breakeven)\n\n"
+        "*When alerts fire:*\n"
+        "9:30 AM – 12:00 PM, then 1:30 PM – 2:30 PM\n"
+        "Lunch (12:00–1:30) is silenced.\n"
+        "No new signals after 2:30 PM (square-off pressure).",
+        [("← Back to menu", "guide:menu")],
+    ),
+    "swing": (
+        "🟪 *Swing Alerts (`/swing_alerts`)*\n\n"
+        "*What it does:*\n"
+        "Once daily at ~3:45 PM IST, after market close, bot runs swing "
+        "analysis on stocks and sends BUY/SELL signals.\n\n"
+        "*Universe scanned:*\n"
+        "• If you've used `/watch SYMBOL` → just those\n"
+        f"• Otherwise → {len(SWING_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks\n\n"
+        "*Example signal:*\n"
+        "```\n"
+        "🌅 End-of-Day Swing Signal\n"
+        "RELIANCE.NS\n"
+        "🟢 Signal: BUY  (75% confidence)\n"
+        "Indicators:\n"
+        "🟢 SMA: Bullish cross\n"
+        "🟢 RSI: Neutral (58)\n"
+        "🟢 MACD: Positive momentum\n"
+        "🟡 BB: Within bands\n"
+        "🎯 Entry: ₹1,247.50\n"
+        "🛑 SL:    ₹1,221.40  (-2.09%)\n"
+        "🥇 T1:    ₹1,290.20  R:R 1:1.5\n"
+        "🥈 T2:    ₹1,326.80  R:R 1:3.0\n"
+        "```\n\n"
+        "*What you do:*\n"
+        "Place positional order at next morning's open.\n"
+        "Hold for days to weeks. Use the SL/T1/T2 levels.\n\n"
+        "_HOLD signals are silenced — only actionable BUY/SELL trigger an alert._",
+        [("← Back to menu", "guide:menu")],
+    ),
+    "reports": (
+        "📊 *Reports*\n\n"
+        "*`/today`* — on-demand report right now.\n"
+        "Shows every alert fired today + outcome (T1/SL/expired) "
+        "+ paper P&L.\n\n"
+        "*`/eod_report on`* — same report, automatic at 3:35 PM IST daily.\n\n"
+        "*Example:*\n"
+        "```\n"
+        "📊 End-of-Day Report — 2026-05-08\n"
+        "\n"
+        "🟦 Intraday auto-scan\n"
+        "Total: 3 • ✅ 2 • ❌ 1 • Σ +1.50%\n"
+        "  10:32  RELIANCE   long   ✅ T2 hit  +1.50%\n"
+        "  11:15  TCS        short  ❌ SL hit  -0.96%\n"
+        "  14:05  HDFCBANK   long   🟡 T1+BE  +0.50%\n"
+        "\n"
+        "🟪 Swing\n"
+        "Total: 1 • ⏳ 1 open\n"
+        "  15:48  INFY       BUY    ⏳ Open\n"
+        "```\n\n"
+        "*Important:* P&L is hypothetical. Assumes you took every "
+        "signal at the published Entry/SL/T1/T2 with default 50/50 "
+        "partial exits. Real P&L = your actual trades only.",
+        [("← Back to menu", "guide:menu")],
+    ),
+    "signal": (
+        "🎯 *How to read a signal*\n\n"
+        "Every alert has these fields:\n\n"
+        "🟢 *LONG / 🔴 SHORT*\n"
+        "Direction. LONG = buy. SHORT = sell-short.\n\n"
+        "🎯 *Entry*\n"
+        "Price to enter at — close of the trigger candle.\n\n"
+        "🛑 *SL (Stop Loss)*\n"
+        "If price hits this, exit immediately.\n"
+        "Shown with % distance from entry.\n\n"
+        "🥇 *T1* / 🥈 *T2*\n"
+        "First and second profit targets.\n"
+        "Sell 50% at T1, 50% at T2.\n\n"
+        "*RR (Reward:Risk)*\n"
+        "1:1.5 means: for ₹1 risk, you make ₹1.50.\n\n"
+        "*Position sizing — use this formula:*\n"
+        "```\n"
+        "Quantity = (Capital × 0.005) / (Entry − SL)\n"
+        "```\n\n"
+        "*Example:*\n"
+        "Capital ₹1,00,000\n"
+        "Entry  ₹1,247.50\n"
+        "SL     ₹1,235.20  (risk ₹12.30/share)\n"
+        "Quantity = 500 / 12.30 = *40 shares*\n"
+        "Order value = 40 × 1247.50 = *₹49,900*\n\n"
+        "_This sizes you to risk only 0.5% of capital per trade — "
+        "the rule that keeps losses survivable._",
+        [("← Back to menu", "guide:menu")],
+    ),
+    "day": (
+        "🔄 *A day with the bot*\n\n"
+        "```\n"
+        "09:15  NSE opens\n"
+        "09:30  Bot starts auto-scanning 104 stocks\n"
+        "10:32  🔔 RELIANCE Setup A LONG fires\n"
+        "        → you place bracket order in broker\n"
+        "11:14  Price hits T1 (your broker exits 50%)\n"
+        "11:14  Move SL to entry (breakeven on rest)\n"
+        "11:50  Price hits T2 (broker exits remaining)\n"
+        "        Trade complete — won't re-alert today\n"
+        "12:00  Lunch silence (12:00-1:30)\n"
+        "13:30  Bot resumes scanning\n"
+        "14:05  🔔 BAJFINANCE Setup A SHORT fires\n"
+        "        → you short-sell\n"
+        "14:30  No new entries after this\n"
+        "15:00  Manage open intraday positions\n"
+        "15:15  Mandatory square-off (close everything)\n"
+        "15:30  NSE closes\n"
+        "15:35  📊 EOD report arrives in your chat\n"
+        "        → review wins/losses for the day\n"
+        "15:45  🌅 Swing alerts arrive\n"
+        "        → set positional orders for tomorrow\n"
+        "```",
+        [("← Back to menu", "guide:menu")],
+    ),
+    "risk": (
+        "⚠️ *Risk + Disclaimers*\n\n"
+        "*1. Educational only.*\n"
+        "Not SEBI-registered. Not financial advice. Use signals as "
+        "one input, not as commands. You are the trader.\n\n"
+        "*2. Paper-trade first.*\n"
+        "Recent backtest showed the strategy is net negative after "
+        "costs in current market. Don't risk real capital until you "
+        "measure 30+ days of paper trades and see positive expectancy.\n\n"
+        "*3. Costs eat thin edges.*\n"
+        f"~{COST_PER_TRADE_PCT:.2f}% per round trip (brokerage + STT + slippage).\n"
+        f"A 1% gross target → ~{1.0 - COST_PER_TRADE_PCT:.2f}% net per leg.\n\n"
+        "*4. Position sizing > picking.*\n"
+        "Risk only 0.5% of capital per trade.\n"
+        "Daily loss limit: 1.5% → stop trading for the day.\n"
+        "Stop loss is sacred — never average down.\n\n"
+        "*5. Free data has lag.*\n"
+        "yfinance: ~15 min delayed.\n"
+        "Angel One: realtime if configured.\n"
+        "Either way, signals come from past closes.\n\n"
+        "*6. Markets can blow up.*\n"
+        "News events, circuit limits, exchange halts. Bracket orders "
+        "with SL are mandatory. Trade with money you can lose.\n\n"
+        "Trade safe.",
+        [("← Back to menu", "guide:menu")],
+    ),
+}
+
+
+def _guide_keyboard(buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Build a 1-column inline keyboard from (label, callback_data) pairs."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=cb)] for label, cb in buttons]
+    )
+
+
+async def guide_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the guide menu."""
+    text, buttons = GUIDE_SECTIONS["menu"]
+    await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=_guide_keyboard(buttons)
+    )
+
+
+async def universe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the universes used by /scan_alerts and /swing_alerts."""
+    user_id = update.effective_user.id
+    wl = subscriptions.get_watchlist(user_id)
+    intraday_n = len(INTRADAY_UNIVERSE)
+    swing_n = len(SWING_UNIVERSE)
+    intraday_sample = ", ".join(INTRADAY_UNIVERSE[:10])
+    msg = (
+        "*📡 Stock universes*\n\n"
+        f"*Intraday (`/scan_alerts`)* — fixed:\n"
+        f"  NIFTY 100 + Bank NIFTY = *{intraday_n} stocks*\n"
+        f"  Sample: {intraday_sample}…\n\n"
+        f"*Swing (`/swing_alerts`)*:\n"
+    )
+    if wl:
+        msg += (
+            f"  Your watchlist = *{len(wl)} stock(s)*\n"
+            f"  ({', '.join(wl[:8])}{'…' if len(wl) > 8 else ''})\n"
+        )
+    else:
+        msg += (
+            f"  Watchlist empty → defaulting to NIFTY 100 + Bank NIFTY "
+            f"= *{swing_n} stocks*\n"
+            "  Add personal stocks via `/watch SYMBOL` to override.\n"
+        )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 def _is_swing_run_window(now: datetime | None = None) -> bool:
@@ -557,18 +813,22 @@ async def _swing_alert_tick(app: Application) -> None:
 
     for uid in subs:
         watchlist = subscriptions.get_watchlist(uid)
+        used_universe = False
         if not watchlist:
+            # Fall back to SWING_UNIVERSE so users get alerts without curating.
+            watchlist = list(SWING_UNIVERSE)
+            used_universe = True
             try:
                 await app.bot.send_message(
                     uid,
-                    "🌅 *End-of-Day Swing Run*\n\n"
-                    "Your watchlist is empty — nothing to scan.\n"
-                    "Add stocks via `/watch RELIANCE` to get alerts tomorrow.",
+                    f"🌅 *End-of-Day Swing Run*\n\n"
+                    f"Watchlist empty — scanning default universe of "
+                    f"{len(watchlist)} NIFTY 100 + Bank NIFTY stocks.\n"
+                    "Add stocks via `/watch SYMBOL` to scan only those.",
                     parse_mode="Markdown",
                 )
             except Exception as e:
                 logger.warning("swing intro send to %s failed: %s", uid, e)
-            continue
 
         sent = 0
         for symbol in watchlist:
@@ -576,7 +836,7 @@ async def _swing_alert_tick(app: Application) -> None:
                 result = await asyncio.to_thread(analyze, symbol, "swing")
             except Exception as e:
                 logger.warning("swing analyze failed for %s/%s: %s", uid, symbol, e)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(SCAN_PACING_SEC)
                 continue
             if result["signal"] in ("BUY", "SELL"):
                 ts = result.get("trade_setup", {})
@@ -598,7 +858,7 @@ async def _swing_alert_tick(app: Application) -> None:
                     sent += 1
                 except Exception as e:
                     logger.warning("swing signal send to %s failed: %s", uid, e)
-            await asyncio.sleep(0.5)  # Angel rate-limit pacing
+            await asyncio.sleep(SCAN_PACING_SEC)  # Angel rate-limit pacing
 
         # Send a summary so the user knows the run completed even with no signals
         try:
@@ -724,6 +984,7 @@ async def _eod_report_loop(app: Application) -> None:
 # Set once in _post_init via bot.set_my_commands().
 COMMAND_MENU = [
     BotCommand("start", "Welcome + command list"),
+    BotCommand("guide", "Interactive walkthrough — start here"),
     BotCommand("help", "Same as /start"),
     # Analysis
     BotCommand("swing", "Swing analysis  (e.g. /swing RELIANCE)"),
@@ -738,6 +999,7 @@ COMMAND_MENU = [
     # EOD report
     BotCommand("eod_report", "Daily summary report (on/off)"),
     BotCommand("today", "On-demand EOD report"),
+    BotCommand("universe", "Show scan/swing universes"),
     # Watchlist
     BotCommand("watch", "Add to watchlist  (e.g. /watch INFY)"),
     BotCommand("unwatch", "Remove from watchlist"),
@@ -777,22 +1039,36 @@ def main():
         builder = builder.request(req).get_updates_request(get_updates_req)
 
     app = builder.build()
+    # Onboarding
     app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(CommandHandler("analyze", analyze_cmd))
-    app.add_handler(CommandHandler("swing", swing_cmd))
+    app.add_handler(CommandHandler("guide", guide_cmd))
+
+    # Stock analysis (swing + intraday + quick variants)
+    app.add_handler(CommandHandler(["swing", "analyze"], swing_cmd))
     app.add_handler(CommandHandler("intraday", intraday_cmd))
     app.add_handler(CommandHandler("quick", quick_cmd))
     app.add_handler(CommandHandler("quickintra", quickintra_cmd))
+
+    # Scanner
+    app.add_handler(CommandHandler("scan", scan_cmd))
+    app.add_handler(CommandHandler("scan_alerts", scan_alerts_cmd))
+
+    # Swing alerts
+    app.add_handler(CommandHandler("swing_alerts", swing_alerts_cmd))
+
+    # EOD report
+    app.add_handler(CommandHandler("eod_report", eod_report_cmd))
+    app.add_handler(CommandHandler("today", today_cmd))
+
+    # Watchlist
     app.add_handler(CommandHandler("watch", watch_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("mywatch", mywatch_cmd))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("scan_alerts", scan_alerts_cmd))
-    app.add_handler(CommandHandler("swing_alerts", swing_alerts_cmd))
-    app.add_handler(CommandHandler("eod_report", eod_report_cmd))
-    app.add_handler(CommandHandler("today", today_cmd))
-    app.add_handler(CommandHandler("angel_login", angel_login_cmd))
+
+    # Diagnostics
+    app.add_handler(CommandHandler("universe", universe_cmd))
     app.add_handler(CommandHandler("angel_status", angel_status_cmd))
+    app.add_handler(CommandHandler("angel_login", angel_login_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

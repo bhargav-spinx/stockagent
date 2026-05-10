@@ -30,15 +30,13 @@ ssl_dev.install_if_enabled()
 from data_provider import fetch_data  # noqa: E402
 from scanner_filters import apply_universal_filters  # noqa: E402
 from scanner_setups import ALL_DETECTORS, Signal  # noqa: E402
+from universe import (  # noqa: E402
+    INTRADAY_UNIVERSE,
+    SWING_UNIVERSE,
+    TIER1_WATCHLIST,
+)
 
 logger = logging.getLogger(__name__)
-
-# Tier-1 starting watchlist from STRATEGY.md §3
-TIER1_WATCHLIST = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
-    "KOTAKBANK", "INFY", "TCS", "LT", "BAJFINANCE",
-    "MARUTI", "TATAMOTORS", "ITC", "HINDUNILVR",
-]
 
 
 def _normalize(symbol: str) -> str:

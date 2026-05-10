@@ -33,6 +33,11 @@ from data_provider import fetch_data
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
+# STRATEGY.md §8 cost model: ~0.05% brokerage/STT per side + ~0.05% slippage
+# entry + ~0.03% slippage exit ≈ 0.13% round-trip on tier-1 NSE stocks.
+# Single source of truth — imported by backtest.py and bot.py.
+COST_PER_TRADE_PCT = 0.13
+
 INTRADAY_CATEGORIES = {"scan", "manual_intraday"}
 SWING_CATEGORIES = {"swing_auto", "manual_swing"}
 
@@ -377,7 +382,7 @@ def build_report(user_id: int | None = None,
     parts = [
         f"📊 *End-of-Day Report* — {trade_date_str}\n",
         "_Hypothetical paper-trade outcomes assuming default 50/50 partial-exit rules._\n",
-        "_Gross of brokerage/STT/slippage (~0.13% round-trip)._\n\n",
+        f"_Gross of brokerage/STT/slippage (~{COST_PER_TRADE_PCT:.2f}% round-trip)._\n\n",
         _format_section("🟦 Intraday auto-scan (/scan_alerts)", scan_rows),
         _format_section("🟧 Manual intraday (/intraday)", manual_intraday_rows),
         _format_section("🟪 Swing (/swing_alerts + /swing)", swing_rows),

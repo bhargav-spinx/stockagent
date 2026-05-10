@@ -23,14 +23,33 @@ class FilterResult:
         return self.passed
 
 
-def time_window_filter(now: datetime | None = None) -> FilterResult:
+def is_intraday_entry_window(now: datetime | None = None) -> bool:
     """
-    No new entries:
-    - Before 09:30 IST (ORB still forming)
-    - 12:00–13:30 IST (lunch chop)
-    - After 14:30 IST (square-off pressure)
+    Single source of truth for the intraday entry-allowed window.
+
+    Returns True iff `now` is in the period when new intraday entries
+    are allowed per STRATEGY.md §5: Mon–Fri, 09:30–14:30 IST,
+    excluding lunch (12:00–13:30).
     """
     now = now or datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    if t < time(9, 30) or t >= time(14, 30):
+        return False
+    if time(12, 0) <= t < time(13, 30):
+        return False
+    return True
+
+
+def time_window_filter(now: datetime | None = None) -> FilterResult:
+    """
+    Setup-level wrapper around `is_intraday_entry_window` that returns
+    a structured FilterResult with a human-readable rejection reason.
+    """
+    now = now or datetime.now(IST)
+    if now.weekday() >= 5:
+        return FilterResult(False, "Weekend — NSE closed")
     t = now.time()
     if t < time(9, 30):
         return FilterResult(False, "Before 09:30 — ORB still forming")

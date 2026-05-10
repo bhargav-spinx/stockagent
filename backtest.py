@@ -31,25 +31,17 @@ import ssl_dev  # noqa: E402
 ssl_dev.install_if_enabled()
 
 from data_provider import fetch_data  # noqa: E402
-from scanner_filters import apply_universal_filters  # noqa: E402
+from scanner_filters import apply_universal_filters, is_intraday_entry_window  # noqa: E402
 from scanner_setups import detect_setup_a, detect_setup_b, detect_setup_c, Signal  # noqa: E402
+from universe import TIER1_WATCHLIST  # noqa: E402
 import eod_report  # noqa: E402
+from eod_report import COST_PER_TRADE_PCT  # noqa: E402
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
-# §8 cost model: ~0.05% per side brokerage/STT/fees + ~0.05% slippage entry +
-# ~0.03% slippage exit ≈ 0.13% round-trip.
-COST_PER_TRADE_PCT = 0.13
-
 # Min candles required before any setup can fire (indicator warm-up)
 MIN_WARMUP_CANDLES = 30
-
-TIER1_WATCHLIST = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
-    "KOTAKBANK", "INFY", "TCS", "LT", "BAJFINANCE",
-    "MARUTI", "TATAMOTORS", "ITC", "HINDUNILVR",
-]
 
 
 # ---------- data structures ----------
@@ -179,18 +171,6 @@ def _normalize_ist(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _is_trading_window(ts: datetime) -> bool:
-    """09:30–14:30 IST, no lunch (12:00–13:30), Mon–Fri."""
-    if ts.weekday() >= 5:
-        return False
-    t = ts.time()
-    if t < dt_time(9, 30) or t >= dt_time(14, 30):
-        return False
-    if dt_time(12, 0) <= t < dt_time(13, 30):
-        return False
-    return True
-
-
 def _resolve_outcome(sig: Signal, sig_time: datetime, df: pd.DataFrame) -> dict:
     """Use eod_report's resolver against a pre-fetched df."""
     alert = {
@@ -250,7 +230,7 @@ def backtest_symbol(symbol: str, days: int = 90,
             fired_today.clear()
             last_session_date = cur_date
 
-        if not _is_trading_window(ts):
+        if not is_intraday_entry_window(ts):
             continue
         candles_in_window += 1
 
