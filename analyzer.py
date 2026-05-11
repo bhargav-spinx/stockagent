@@ -41,13 +41,26 @@ MODES = {
 
 def normalize_symbol(symbol: str) -> str:
     """
-    Convert user input to yfinance-compatible NSE ticker.
-    'RELIANCE' -> 'RELIANCE.NS', 'TCS.BO' stays as is.
+    Convert user input to a yfinance-compatible ticker.
+    - Index aliases (NIFTY, BANKNIFTY, SENSEX) → yfinance index ticker
+    - 'RELIANCE'                                → 'RELIANCE.NS'
+    - 'TCS.BO'                                  → unchanged
+    - '^NSEI'                                   → unchanged
     """
-    symbol = symbol.upper().strip()
-    if "." not in symbol:
-        symbol = f"{symbol}.NS"  # default to NSE
-    return symbol
+    from indices import resolve_index_alias  # local import to avoid cycles
+
+    s = symbol.strip()
+    if s.startswith("^"):
+        return s  # already a yfinance index ticker
+
+    idx = resolve_index_alias(s)
+    if idx:
+        return idx
+
+    s = s.upper()
+    if "." not in s:
+        s = f"{s}.NS"  # default to NSE
+    return s
 
 
 def is_nse_open() -> bool:

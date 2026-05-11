@@ -45,6 +45,8 @@ from universe import INTRADAY_UNIVERSE, SWING_UNIVERSE
 import subscriptions
 import eod_report
 from eod_report import COST_PER_TRADE_PCT
+from indices import INDICES, PRIMARY_INDICES, display_name as _index_display_name
+from data_provider import fetch_data as _fetch_data
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -78,6 +80,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/swing_alerts on` — end-of-day BUY/SELL alerts (15:45 IST, your watchlist)\n"
         "`/eod_report on` — daily summary of alerts + outcomes (15:35 IST)\n"
         "/today — on-demand EOD report right now\n"
+        "/index — NIFTY / Bank NIFTY / SENSEX snapshot\n"
         "/universe — show stocks scanned by alerts\n"
         "/watch SYMBOL — add to watchlist\n"
         "/unwatch SYMBOL — remove from watchlist\n"
@@ -859,6 +862,67 @@ async def guide_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _fetch_index_snapshot(alias: str) -> dict | None:
+    """Fetch last close + day change for a single index. Synchronous."""
+    yf_sym, name = INDICES[alias]
+    try:
+        df = _fetch_data(yf_sym, period="5d", interval="1d")
+    except Exception as e:
+        logger.warning("index fetch failed for %s: %s", alias, e)
+        return None
+    if df is None or df.empty or len(df) < 2:
+        return None
+    last = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2])
+    change = last - prev
+    change_pct = (change / prev) * 100 if prev else 0.0
+    day_high = float(df["High"].iloc[-1])
+    day_low = float(df["Low"].iloc[-1])
+    return {
+        "alias": alias,
+        "name": name,
+        "last": last,
+        "prev": prev,
+        "change": change,
+        "change_pct": change_pct,
+        "day_high": day_high,
+        "day_low": day_low,
+    }
+
+
+async def index_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Snapshot of NIFTY 50, Bank NIFTY, and SENSEX."""
+    await update.message.reply_text("📊 Fetching index snapshots…")
+    snaps = []
+    for alias in PRIMARY_INDICES:
+        snap = await asyncio.to_thread(_fetch_index_snapshot, alias)
+        if snap:
+            snaps.append(snap)
+
+    if not snaps:
+        await update.message.reply_text(
+            "❌ Couldn't fetch any index data. Try `/angel_status` to check the data source.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["*📊 Index Snapshot*\n"]
+    for s in snaps:
+        arrow = "📈" if s["change"] >= 0 else "📉"
+        sign = "+" if s["change"] >= 0 else ""
+        lines.append(
+            f"*{s['name']}*\n"
+            f"  Last: *{s['last']:,.2f}*  {arrow} {sign}{s['change']:,.2f} "
+            f"({sign}{s['change_pct']:.2f}%)\n"
+            f"  Day range: {s['day_low']:,.2f} – {s['day_high']:,.2f}"
+        )
+    lines.append(
+        "\n_Tip: `/swing NIFTY` or `/intraday BANKNIFTY` runs full analysis "
+        "with entry/SL/targets on any index._"
+    )
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 async def universe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the universes used by /scan_alerts and /swing_alerts."""
     user_id = update.effective_user.id
@@ -1110,6 +1174,7 @@ COMMAND_MENU = [
     # EOD report
     BotCommand("eod_report", "Daily summary report (on/off)"),
     BotCommand("today", "On-demand EOD report"),
+    BotCommand("index", "NIFTY / Bank NIFTY / SENSEX snapshot"),
     BotCommand("universe", "Show scan/swing universes"),
     # Watchlist
     BotCommand("watch", "Add to watchlist  (e.g. /watch INFY)"),
@@ -1175,6 +1240,9 @@ def main():
     app.add_handler(CommandHandler("watch", watch_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("mywatch", mywatch_cmd))
+
+    # Market context
+    app.add_handler(CommandHandler("index", index_cmd))
 
     # Diagnostics
     app.add_handler(CommandHandler("universe", universe_cmd))

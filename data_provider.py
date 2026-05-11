@@ -210,8 +210,11 @@ def get_provider_name() -> str:
 def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """
     Fetch OHLCV data. Routes to Angel One when credentials are configured,
-    yfinance otherwise.
+    yfinance otherwise. Indices (symbols starting with `^`) always go to
+    yfinance because Angel's scrip master only has equities.
     """
+    if symbol.startswith("^"):
+        return fetch_yfinance(symbol, period, interval)
     if os.getenv("ANGEL_API_KEY"):
         return fetch_angel(symbol, period, interval)
     return fetch_yfinance(symbol, period, interval)
