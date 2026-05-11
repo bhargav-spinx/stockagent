@@ -383,6 +383,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 AUTOSCAN_INTERVAL_SEC = 300   # run every 5 min
 AUTOSCAN_FIRST_DELAY_SEC = 30  # wait this long after bot start before first run
 
+# Daily counters reset at the first scan of each trading day.
+# Used by the "market quiet" digest at 13:00 IST.
+_today_rejections: dict[str, int] = {}
+_today_signals_fired: int = 0
+_today_stats_date: 'date | None' = None
+
+
+def _reset_daily_stats_if_new_day() -> None:
+    """Reset rejection/signal counters on day change."""
+    global _today_stats_date, _today_signals_fired
+    from datetime import date as _date
+    today_d = _date.today()
+    if _today_stats_date != today_d:
+        _today_stats_date = today_d
+        _today_signals_fired = 0
+        _today_rejections.clear()
+
+
+def _bump_rejection(reason: str) -> None:
+    """Coarse-bucket a rejection reason and increment its count."""
+    bucket = reason.split("(")[0].split("<")[0].split(">")[0].strip()[:50]
+    if bucket:
+        _today_rejections[bucket] = _today_rejections.get(bucket, 0) + 1
+
 
 async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle auto-scan alerts for the calling user. /scan_alerts on|off (no arg = status)."""
@@ -417,6 +441,8 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _autoscan_tick(app: Application) -> None:
     """One pass of the auto-scan loop. Safe to call any time; no-ops outside market hours."""
+    _reset_daily_stats_if_new_day()
+
     if not is_intraday_entry_window():
         return
 
@@ -432,6 +458,12 @@ async def _autoscan_tick(app: Application) -> None:
         logger.exception("autoscan: scan_many crashed: %s", e)
         return
 
+    # Aggregate rejection reasons for the quiet-day digest
+    for r in results:
+        if r["status"] == "skip":
+            _bump_rejection(r["reason"])
+
+    global _today_signals_fired
     new_signals = 0
     for r in results:
         if r["status"] != "signal":
@@ -442,6 +474,7 @@ async def _autoscan_tick(app: Application) -> None:
             continue
         subscriptions.mark_fired(key)
         new_signals += 1
+        _today_signals_fired += 1
 
         # Log once (system-level alert; not per-user — outcome is identical)
         subscriptions.log_alert(
@@ -467,6 +500,74 @@ async def _autoscan_tick(app: Application) -> None:
         logger.info("autoscan: fired %d new signal(s) to %d sub(s)", new_signals, len(subs))
 
 
+# Quiet-day digest: sent once between 13:00–13:15 IST if no signals fired
+# all morning. Gives subscribers visibility into "bot is alive, market is dead".
+QUIET_DIGEST_WINDOW = (dt_time(13, 0), dt_time(13, 15))
+
+
+def _format_quiet_digest() -> str:
+    """Format the 'market quiet so far' message based on today's stats."""
+    total_rejections = sum(_today_rejections.values())
+    if total_rejections == 0:
+        return (
+            "🌤 *Market check — 13:00 IST*\n\n"
+            "I haven't completed any scan cycles yet today. "
+            "If you're expecting alerts, send `/angel_status` to verify the data source is alive."
+        )
+
+    top = sorted(_today_rejections.items(), key=lambda x: -x[1])[:5]
+    lines = [
+        "🌤 *Market quiet so far — 13:00 IST*\n",
+        f"Scanned {len(INTRADAY_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks "
+        f"every 5 min since 09:30 AM.",
+        f"*Zero setups fired in {total_rejections} candle-checks.*\n",
+        "*Why candles were rejected:*",
+    ]
+    for reason, count in top:
+        pct = (count / total_rejections) * 100
+        lines.append(f"• {reason}: *{count}* ({pct:.0f}%)")
+    lines.append("")
+    lines.append(
+        "_Low-volatility regime — strategy correctly skips dead markets._\n"
+        "_If a real setup fires in the afternoon session (13:30–14:30), "
+        "you'll get pinged immediately._"
+    )
+    return "\n".join(lines)
+
+
+async def _quiet_digest_tick(app: Application) -> None:
+    """Send a once-per-day market-quiet digest if no signals fired by lunch."""
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return
+    t = now.time()
+    if not (QUIET_DIGEST_WINDOW[0] <= t < QUIET_DIGEST_WINDOW[1]):
+        return
+
+    key = f"quiet_digest:{now.date().isoformat()}"
+    if subscriptions.already_fired(key):
+        return  # already sent today
+
+    subs = subscriptions.get_subscribers()
+    if not subs:
+        subscriptions.mark_fired(key)
+        return
+
+    # If we DID fire signals this morning, don't send the digest at all
+    if _today_signals_fired > 0:
+        subscriptions.mark_fired(key)
+        return
+
+    subscriptions.mark_fired(key)
+    msg = _format_quiet_digest()
+    for uid in subs:
+        try:
+            await app.bot.send_message(uid, msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("quiet digest send to %s failed: %s", uid, e)
+    logger.info("quiet digest sent to %d subscriber(s)", len(subs))
+
+
 async def _autoscan_loop(app: Application) -> None:
     """Run forever: tick every AUTOSCAN_INTERVAL_SEC."""
     logger.info("autoscan loop started (every %ds)", AUTOSCAN_INTERVAL_SEC)
@@ -476,6 +577,10 @@ async def _autoscan_loop(app: Application) -> None:
             await _autoscan_tick(app)
         except Exception as e:
             logger.exception("autoscan loop tick failed: %s", e)
+        try:
+            await _quiet_digest_tick(app)
+        except Exception as e:
+            logger.exception("quiet digest tick failed: %s", e)
         # Daily dedup-table prune (cheap, just runs every 5 min)
         try:
             subscriptions.purge_old_signals(keep_days=2)
@@ -925,7 +1030,10 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Building report — resolving outcomes…")
     try:
         report = await asyncio.to_thread(
-            eod_report.build_report, update.effective_user.id
+            eod_report.build_report,
+            update.effective_user.id,
+            None,
+            dict(_today_rejections),
         )
     except Exception as e:
         logger.exception("today_cmd build_report failed: %s", e)
@@ -961,9 +1069,12 @@ async def _eod_report_tick(app: Application) -> None:
     logger.info("EOD report: running for %d subscriber(s)", len(subs))
     subscriptions.mark_fired(key)
 
+    rejection_snapshot = dict(_today_rejections)
     for uid in subs:
         try:
-            report = await asyncio.to_thread(eod_report.build_report, uid)
+            report = await asyncio.to_thread(
+                eod_report.build_report, uid, None, rejection_snapshot
+            )
             await app.bot.send_message(uid, report, parse_mode="Markdown")
         except Exception as e:
             logger.warning("EOD report send to %s failed: %s", uid, e)

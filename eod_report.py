@@ -362,10 +362,13 @@ def _format_section(title: str, rows: list[dict[str, Any]]) -> str:
 
 
 def build_report(user_id: int | None = None,
-                trade_date_str: str | None = None) -> str:
+                trade_date_str: str | None = None,
+                today_rejection_stats: dict[str, int] | None = None) -> str:
     """
     Build the EOD report text. If user_id given, only their alerts; else all.
     Resolves any pending alerts before formatting.
+    If `today_rejection_stats` is provided AND the day has zero alerts, the
+    report includes a "why no alerts today?" breakdown.
     """
     resolved_now = resolve_pending(max_age_days=30)
     if resolved_now:
@@ -387,4 +390,35 @@ def build_report(user_id: int | None = None,
         _format_section("🟧 Manual intraday (/intraday)", manual_intraday_rows),
         _format_section("🟪 Swing (/swing_alerts + /swing)", swing_rows),
     ]
+
+    # If today had zero alerts and we have rejection stats, explain why
+    if not all_today and today_rejection_stats:
+        parts.append(_format_empty_day_explanation(today_rejection_stats))
+
     return "\n".join(parts)
+
+
+def _format_empty_day_explanation(rejections: dict[str, int]) -> str:
+    """Render a 'why no alerts today?' section based on filter rejection stats."""
+    total = sum(rejections.values())
+    if total == 0:
+        return (
+            "\n*Why no alerts today?*\n"
+            "_No scan cycles completed — check `/angel_status` or VM service health._"
+        )
+    top = sorted(rejections.items(), key=lambda x: -x[1])[:5]
+    lines = [
+        "\n*Why no alerts today?*",
+        f"_Across {total} candle-checks today, every one was filtered out._",
+        "",
+        "*Top rejection reasons:*",
+    ]
+    for reason, count in top:
+        pct = (count / total) * 100
+        lines.append(f"• {reason}: *{count}* ({pct:.0f}%)")
+    lines.append("")
+    lines.append(
+        "_The strategy correctly skipped dead markets. This is normal in "
+        "low-volatility regimes — you'll get pings the moment a real setup fires._"
+    )
+    return "\n".join(lines)
