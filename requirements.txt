@@ -7,3 +7,11 @@ smartapi-python
 pyotp
 requests
 pytz
+# Tip parser: text-only works out of the box. For photo OCR, the Tesseract
+# binary must also be installed on the host (Windows: UB-Mannheim build;
+# Linux: `sudo apt install tesseract-ocr`).
+pytesseract
+Pillow
+# Telethon: listen to public Telegram channels via your USER account
+# (separate from Bot API). Used by telethon_listener.py for channel monitoring.
+telethon

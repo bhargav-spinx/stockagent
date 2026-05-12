@@ -124,10 +124,13 @@ def format_signal_telegram(sig: Signal) -> str:
     risk = abs(sig.entry - sig.stop_loss)
     rr1 = abs(sig.target1 - sig.entry) / risk if risk > 0 else 0
     rr2 = abs(sig.target2 - sig.entry) / risk if risk > 0 else 0
-    arrow = "🟢 *LONG*" if sig.direction == "long" else "🔴 *SHORT*"
+    # Direction shown as both color and plain action verb to avoid jargon
+    action = "BUY" if sig.direction == "long" else "SELL-SHORT"
+    arrow = f"🟢 *{action}*" if sig.direction == "long" else f"🔴 *{action}*"
     sl_pct = ((sig.stop_loss - sig.entry) / sig.entry) * 100
     confluences = "\n".join(f"• {c}" for c in sig.confluences)
     return (
+        f"⏱ *INTRADAY* · same-day exit by 3:15 PM\n\n"
         f"📈 *Setup {sig.setup}* — `{sig.symbol}` {arrow}\n\n"
         f"🎯 Entry: ₹{sig.entry:.2f}\n"
         f"🛑 SL:    ₹{sig.stop_loss:.2f} ({sl_pct:+.2f}%)\n"

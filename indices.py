@@ -1,46 +1,90 @@
 """
-Major Indian stock indices used for market-context display + direct analysis.
+Major Indian stock indices for market-context display + direct analysis.
 
-User-facing aliases (NIFTY, BANKNIFTY, SENSEX) → yfinance tickers.
-Angel SmartAPI also supports indices, but their scrip master uses a
-different exchange segment ("NSE" with no `-EQ` suffix) — we route
-indices through yfinance to keep ticker resolution simple.
+Each primary index has:
+- yfinance ticker  (fallback data source)
+- Angel One token + exchange (primary data source when ANGEL_API_KEY set)
+- Display name
+
+The bot routes index fetches through Angel SmartAPI by token (see
+data_provider._fetch_angel_index) when available, falling back to yfinance.
 """
 
-# Friendly alias → (yfinance symbol, display name)
-INDICES: dict[str, tuple[str, str]] = {
-    "NIFTY":      ("^NSEI",    "NIFTY 50"),
-    "NIFTY50":    ("^NSEI",    "NIFTY 50"),
-    "BANKNIFTY":  ("^NSEBANK", "Bank NIFTY"),
-    "NIFTYBANK":  ("^NSEBANK", "Bank NIFTY"),
-    "SENSEX":     ("^BSESN",   "SENSEX"),
-    "BSE":        ("^BSESN",   "SENSEX"),
+# Primary indices: alias → metadata
+PRIMARY = {
+    "NIFTY": {
+        "yf": "^NSEI",
+        "angel_exchange": "NSE",
+        "angel_token": "99926000",
+        "angel_symbol": "Nifty 50",
+        "display": "NIFTY 50",
+    },
+    "BANKNIFTY": {
+        "yf": "^NSEBANK",
+        "angel_exchange": "NSE",
+        "angel_token": "99926009",
+        "angel_symbol": "Nifty Bank",
+        "display": "Bank NIFTY",
+    },
+    "SENSEX": {
+        "yf": "^BSESN",
+        "angel_exchange": "BSE",
+        "angel_token": "99919000",
+        "angel_symbol": "SENSEX",
+        "display": "SENSEX",
+    },
 }
 
-# Primary three for the /index snapshot
+# Friendly alias → primary key. Case + spaces + hyphens stripped on lookup.
+ALIASES = {
+    "NIFTY": "NIFTY",
+    "NIFTY50": "NIFTY",
+    "BANKNIFTY": "BANKNIFTY",
+    "NIFTYBANK": "BANKNIFTY",
+    "SENSEX": "SENSEX",
+    "BSE": "SENSEX",
+}
+
 PRIMARY_INDICES: list[str] = ["NIFTY", "BANKNIFTY", "SENSEX"]
+
+
+def _normalize(symbol: str) -> str:
+    """Strip whitespace, hyphens, .NS/.BO suffix; uppercase."""
+    s = symbol.upper().strip().replace(".NS", "").replace(".BO", "")
+    return s.replace(" ", "").replace("-", "")
+
+
+def get_index_info(symbol: str) -> dict | None:
+    """Return the metadata dict for an index alias, or None if not an index."""
+    norm = _normalize(symbol)
+    if norm.startswith("^"):
+        for info in PRIMARY.values():
+            if info["yf"] == norm or info["yf"].upper() == norm:
+                return info
+        return None
+    key = ALIASES.get(norm)
+    return PRIMARY.get(key) if key else None
 
 
 def resolve_index_alias(symbol: str) -> str | None:
     """
-    If `symbol` is a known index alias (NIFTY, BANKNIFTY, SENSEX),
-    return the yfinance ticker (e.g. '^NSEI'). Otherwise None.
-    Case-insensitive; strips '.NS' suffix if present.
+    If `symbol` is a known index alias, return the yfinance ticker
+    (e.g. '^NSEI'). Otherwise None. Kept for backward compatibility with
+    analyzer.normalize_symbol — yfinance is still the canonical ticker
+    representation passed through the system.
     """
-    s = symbol.upper().strip().replace(".NS", "").replace(".BO", "")
-    s = s.replace(" ", "").replace("-", "")
-    entry = INDICES.get(s)
-    return entry[0] if entry else None
+    info = get_index_info(symbol)
+    return info["yf"] if info else None
 
 
 def display_name(symbol: str) -> str:
-    """Human-readable name for an index symbol (alias or yfinance ticker)."""
-    s = symbol.upper().strip().replace(".NS", "").replace(".BO", "")
-    s = s.replace(" ", "").replace("-", "")
-    if s in INDICES:
-        return INDICES[s][1]
-    # Reverse lookup by yfinance ticker
-    for _, (yf_sym, name) in INDICES.items():
-        if yf_sym == symbol:
-            return name
-    return symbol
+    """Human-readable name for an index symbol."""
+    info = get_index_info(symbol)
+    return info["display"] if info else symbol
+
+
+# Backward-compat: legacy code expects INDICES dict with (yf_ticker, display_name)
+INDICES: dict[str, tuple[str, str]] = {
+    alias: (PRIMARY[primary]["yf"], PRIMARY[primary]["display"])
+    for alias, primary in ALIASES.items()
+}

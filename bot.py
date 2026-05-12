@@ -225,6 +225,31 @@ async def angel_login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Login failed: {e}")
 
 
+async def tg_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show Telethon channel-listener status."""
+    listener = context.application.bot_data.get("telethon_listener")
+    if listener is None:
+        await update.message.reply_text(
+            "📡 *Telethon listener:* not running.\n\n"
+            "Set `TELETHON_API_ID`, `TELETHON_API_HASH`, `TELETHON_PHONE`, "
+            "`TELETHON_CHANNELS`, `TELETHON_NOTIFY_USER_ID` in `.env`, "
+            "then run `python auth_once.py` once, then restart the bot.",
+            parse_mode="Markdown",
+        )
+        return
+    started = listener.started_at.strftime("%Y-%m-%d %H:%M IST") if listener.started_at else "(not yet started)"
+    channels_str = ", ".join(f"@{c}" for c in listener.channels) if listener.channels else "(none)"
+    await update.message.reply_text(
+        f"📡 *Telethon listener*\n\n"
+        f"Status: {'🟢 running' if listener.client else '🔴 stopped'}\n"
+        f"Started: {started}\n"
+        f"Channels: {channels_str}\n"
+        f"Messages seen: *{listener.message_count}*\n"
+        f"Tips detected: *{listener.tip_count}*",
+        parse_mode="Markdown",
+    )
+
+
 async def angel_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Report whether Angel One session is active and which provider is in use."""
     provider = get_provider_name()
@@ -365,6 +390,153 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Plain text handler (treat any message as symbol) ----------
+
+# ---------- Forwarded tip handler ----------
+
+def _format_tip_summary(tip: dict) -> str:
+    """Render extracted tip data as a Telegram message."""
+    arrow = "🟢" if tip["action"] == "BUY" else "🔴"
+    lines = [
+        "📥 *Tip received*\n",
+        f"{arrow} *{tip['symbol']}*  ·  *{tip['action']}*",
+    ]
+    if tip.get("entry"):
+        lines.append(f"🎯 Entry:  ₹{tip['entry']:,.2f}")
+    if tip.get("target"):
+        lines.append(f"🥇 Target: ₹{tip['target']:,.2f}")
+    if tip.get("target2"):
+        lines.append(f"🥈 T2:     ₹{tip['target2']:,.2f}")
+    if tip.get("sl"):
+        lines.append(f"🛑 SL:     ₹{tip['sl']:,.2f}")
+    return "\n".join(lines)
+
+
+def _agreement_verdict(tip: dict, analysis: dict) -> str:
+    """Compare tip's action with our analyzer's signal. Return a verdict message."""
+    bot_sig = analysis["signal"]
+    bot_conf = analysis["confidence"]
+    sym = analysis["symbol"]
+    rsi = analysis["rsi"]
+
+    if tip["action"] == bot_sig:
+        emoji = "✅"
+        verdict = "*Agreement.* My analysis matches the tip."
+    elif bot_sig == "HOLD":
+        emoji = "🟡"
+        verdict = "*Neutral.* My indicators say HOLD — tip is not contradicted but not confirmed either."
+    else:
+        emoji = "⚠️"
+        verdict = "*Conflict.* The tip and my indicators disagree. Verify the source's track record."
+
+    breakdown = "\n".join(
+        f"{'🟢' if s == 'BUY' else '🔴' if s == 'SELL' else '🟡'} {n}: {r}"
+        for n, s, r in analysis["indicators"][:4]
+    )
+    return (
+        f"{emoji} *My analysis of {sym}*\n\n"
+        f"Signal: *{bot_sig}*  ({bot_conf}% confidence)\n"
+        f"RSI: {rsi}\n\n"
+        f"{breakdown}\n\n"
+        f"{verdict}\n\n"
+        "_Educational only — not financial advice. Verify before trading._"
+    )
+
+
+async def tip_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle messages that may contain a stock tip:
+    - Forwarded messages in private chat (user-initiated cross-check)
+    - Direct photos in private chat (user pastes a screenshot)
+    - All messages in groups where the bot is a member (auto-monitor)
+
+    Behavior differs by chat type:
+    - Private chat: always reply, including "no tip detected" feedback.
+    - Group chat:   reply ONLY when a tip is detected — silent otherwise
+                    so the bot doesn't spam every chat message.
+    """
+    msg = update.message
+    if not msg:
+        return
+
+    is_private = msg.chat.type == "private"
+    is_forwarded = bool(msg.forward_origin or msg.forward_from or msg.forward_from_chat)
+
+    text_payload = (msg.text or msg.caption or "").strip()
+    photo = msg.photo[-1] if msg.photo else None
+
+    # Build known-tickers universe (NIFTY 100 + Bank NIFTY)
+    known_tickers = set(INTRADAY_UNIVERSE)
+
+    import tip_parser
+
+    # Step 1: try text extraction
+    tip = None
+    if text_payload:
+        tip = tip_parser.extract_tip(text_payload, known_tickers)
+
+    # Step 2: if no text tip and we have a photo, try OCR
+    # In groups we OCR silently — only respond if a tip is found.
+    ocr_text = None
+    if not tip and photo:
+        if is_private:
+            await msg.reply_text("📷 OCR'ing screenshot…")
+        try:
+            f = await context.bot.get_file(photo.file_id)
+            image_bytes = bytes(await f.download_as_bytearray())
+            tip = await asyncio.to_thread(
+                tip_parser.extract_tip_from_image, image_bytes, known_tickers
+            )
+            if tip:
+                ocr_text = tip.get("_ocr_text")
+        except RuntimeError as e:
+            if is_private:
+                await msg.reply_text(f"⚠️ OCR unavailable:\n`{e}`", parse_mode="Markdown")
+            return
+        except Exception as e:
+            logger.exception("OCR failed: %s", e)
+            if is_private:
+                await msg.reply_text(f"❌ OCR error: {e}")
+            return
+
+    if not tip:
+        # Groups: silent on non-tip messages. Private: explain.
+        if not is_private:
+            return
+        # Private chat: only nag if the user clearly intended to send a tip
+        # (forwarded message or photo). Random text falls through to text_handler.
+        if not is_forwarded and not photo:
+            return
+        sample = "BUY RELIANCE @ 1247, SL 1235, TGT 1260"
+        await msg.reply_text(
+            "🤔 Couldn't extract a tip from this message.\n\n"
+            "I look for:\n"
+            "• A symbol matching NIFTY 100 + Bank NIFTY (e.g. `RELIANCE`)\n"
+            "• A clear `BUY` or `SELL` keyword\n"
+            "• Optional `Entry`, `Target`, `SL` levels\n\n"
+            f"_Example: `{sample}`_",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Step 3: summarize what we extracted
+    await msg.reply_text(_format_tip_summary(tip), parse_mode="Markdown")
+
+    if ocr_text and len(ocr_text) < 400:
+        await msg.reply_text(
+            f"_OCR text read:_\n```\n{ocr_text}\n```",
+            parse_mode="Markdown",
+        )
+
+    # Step 4: cross-check with our analyzer
+    await msg.reply_text(f"🔍 Running my own analysis on {tip['symbol']}…")
+    try:
+        result = await asyncio.to_thread(analyze, tip["symbol"], "swing")
+    except Exception as e:
+        await msg.reply_text(f"❌ Couldn't analyze {tip['symbol']}: {e}")
+        return
+
+    await msg.reply_text(_agreement_verdict(tip, result), parse_mode="Markdown")
+
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = update.message.text.strip()
@@ -894,7 +1066,9 @@ async def index_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Snapshot of NIFTY 50, Bank NIFTY, and SENSEX."""
     await update.message.reply_text("📊 Fetching index snapshots…")
     snaps = []
-    for alias in PRIMARY_INDICES:
+    for i, alias in enumerate(PRIMARY_INDICES):
+        if i > 0:
+            await asyncio.sleep(SCAN_PACING_SEC)  # respect Angel rate limit
         snap = await asyncio.to_thread(_fetch_index_snapshot, alias)
         if snap:
             snaps.append(snap)
@@ -1021,7 +1195,11 @@ async def _swing_alert_tick(app: Application) -> None:
                         target1=ts["target1"],
                         target2=ts["target2"],
                     )
-                msg = "🌅 *End-of-Day Swing Signal*\n\n" + format_report(result)
+                msg = (
+                    "📅 *SWING / POSITIONAL* · hold days to weeks\n\n"
+                    "🌅 *End-of-Day Swing Signal*\n\n"
+                    + format_report(result)
+                )
                 try:
                     await app.bot.send_message(uid, msg, parse_mode="Markdown")
                     sent += 1
@@ -1176,6 +1354,7 @@ COMMAND_MENU = [
     BotCommand("today", "On-demand EOD report"),
     BotCommand("index", "NIFTY / Bank NIFTY / SENSEX snapshot"),
     BotCommand("universe", "Show scan/swing universes"),
+    BotCommand("tg_status", "Telethon channel-listener status"),
     # Watchlist
     BotCommand("watch", "Add to watchlist  (e.g. /watch INFY)"),
     BotCommand("unwatch", "Remove from watchlist"),
@@ -1197,6 +1376,22 @@ async def _post_init(app: Application) -> None:
     app.bot_data["autoscan_task"] = asyncio.create_task(_autoscan_loop(app))
     app.bot_data["swing_alert_task"] = asyncio.create_task(_swing_alert_loop(app))
     app.bot_data["eod_report_task"] = asyncio.create_task(_eod_report_loop(app))
+
+    # Telethon channel listener (optional — only if TELETHON_* env vars set
+    # AND auth_once.py has been run to create telethon_session.session)
+    try:
+        import telethon_listener
+        if telethon_listener._enabled():
+            app.bot_data["telethon_task"] = asyncio.create_task(
+                telethon_listener.run_listener(app)
+            )
+            logger.info("Telethon listener task launched")
+        else:
+            logger.info("Telethon disabled (set TELETHON_* env vars to enable)")
+    except ImportError:
+        logger.info("Telethon not installed — skipping channel listener")
+    except Exception as e:
+        logger.warning("Telethon listener init failed: %s", e)
 
 
 # ---------- Main ----------
@@ -1246,10 +1441,34 @@ def main():
 
     # Diagnostics
     app.add_handler(CommandHandler("universe", universe_cmd))
+    app.add_handler(CommandHandler("tg_status", tg_status_cmd))
     app.add_handler(CommandHandler("angel_status", angel_status_cmd))
     app.add_handler(CommandHandler("angel_login", angel_login_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    # Tip handlers — must come BEFORE the bare text_handler so forwarded
+    # text and group-chat tips aren't treated as ticker lookups.
+    # 1. Forwarded messages in private chat
+    app.add_handler(MessageHandler(
+        filters.FORWARDED & (filters.TEXT | filters.PHOTO | filters.CAPTION),
+        tip_message_handler,
+    ))
+    # 2. Non-forwarded photos in private (user pastes a tip screenshot)
+    app.add_handler(MessageHandler(
+        filters.PHOTO & ~filters.FORWARDED & filters.ChatType.PRIVATE,
+        tip_message_handler,
+    ))
+    # 3. Group messages (silent unless a tip is detected). Requires the bot
+    #    to be a group member AND privacy mode to be DISABLED in BotFather.
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS
+        & (filters.TEXT | filters.PHOTO | filters.CAPTION)
+        & ~filters.COMMAND,
+        tip_message_handler,
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        text_handler,
+    ))
 
     # Webhook mode (Cloud Run / any HTTPS host) when WEBHOOK_URL is set.
     # PORT comes from the platform; defaults to 8080 (Cloud Run convention).

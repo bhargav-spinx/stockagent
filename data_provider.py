@@ -149,6 +149,64 @@ def _resolve_token(symbol: str):
     raise ValueError(f"'{symbol}' not found in Angel scrip master (looked for {target} on {exch})")
 
 
+def _fetch_angel_by_token(exchange: str, token: str, period: str, interval: str,
+                           label: str) -> pd.DataFrame:
+    """
+    Lower-level Angel fetch by explicit token + exchange.
+    Used for indices (which aren't in the standard SYMBOL-EQ format).
+    """
+    angel_interval = ANGEL_INTERVALS.get(interval)
+    if not angel_interval:
+        raise ValueError(f"Interval '{interval}' not supported by Angel One. "
+                         f"Supported: {', '.join(ANGEL_INTERVALS)}")
+    days = PERIOD_DAYS.get(period, 180)
+
+    now = datetime.now(IST)
+    params = {
+        "exchange": exchange,
+        "symboltoken": token,
+        "interval": angel_interval,
+        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+        "todate": now.strftime("%Y-%m-%d %H:%M"),
+    }
+
+    def call():
+        smart = _get_angel_session()
+        return smart.getCandleData(params)
+
+    try:
+        resp = call()
+    except Exception as e:
+        logger.warning("Angel index call failed (%s); re-authenticating", e)
+        _reset_angel_session()
+        resp = call()
+
+    if not resp.get("status") or not resp.get("data"):
+        raise ValueError(f"No Angel data for {label}: {resp.get('message')}")
+
+    df = pd.DataFrame(resp["data"],
+                      columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.set_index("timestamp")
+    df.index = df.index.tz_convert(IST) if df.index.tz else df.index.tz_localize(IST)
+    return df
+
+
+def fetch_angel_index(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """Fetch index OHLCV from Angel using token lookup in indices.py."""
+    from indices import get_index_info
+    info = get_index_info(symbol)
+    if not info:
+        raise ValueError(f"'{symbol}' is not a recognized index")
+    return _fetch_angel_by_token(
+        exchange=info["angel_exchange"],
+        token=info["angel_token"],
+        period=period,
+        interval=interval,
+        label=info["display"],
+    )
+
+
 def fetch_angel(symbol: str, period: str, interval: str) -> pd.DataFrame:
     """Fetch OHLCV from Angel One. Returns DataFrame indexed by timestamp."""
     angel_interval = ANGEL_INTERVALS.get(interval)
@@ -209,12 +267,24 @@ def get_provider_name() -> str:
 
 def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """
-    Fetch OHLCV data. Routes to Angel One when credentials are configured,
-    yfinance otherwise. Indices (symbols starting with `^`) always go to
-    yfinance because Angel's scrip master only has equities.
+    Fetch OHLCV. Routes:
+    - Indices (^... or known aliases) → Angel by token, yfinance fallback
+    - Stocks → Angel by SYMBOL-EQ lookup, yfinance fallback
     """
-    if symbol.startswith("^"):
-        return fetch_yfinance(symbol, period, interval)
+    from indices import get_index_info
+    idx_info = get_index_info(symbol)
+
+    if idx_info is not None:
+        if os.getenv("ANGEL_API_KEY"):
+            try:
+                return fetch_angel_index(symbol, period, interval)
+            except Exception as e:
+                logger.warning(
+                    "Angel index fetch failed for %s (%s) — falling back to yfinance",
+                    symbol, e,
+                )
+        return fetch_yfinance(idx_info["yf"], period, interval)
+
     if os.getenv("ANGEL_API_KEY"):
         return fetch_angel(symbol, period, interval)
     return fetch_yfinance(symbol, period, interval)
