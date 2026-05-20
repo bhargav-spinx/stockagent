@@ -4,6 +4,10 @@ pandas
 numpy
 python-dotenv
 smartapi-python
+# smartapi-python transitive deps — pinned because they don't always install cleanly
+logzero
+websocket-client
+six
 pyotp
 requests
 pytz
