@@ -769,6 +769,8 @@ async def _autoscan_loop(app: Application) -> None:
 # Run once per trading day in this window
 SWING_RUN_WINDOW = (dt_time(15, 45), dt_time(16, 15))
 SWING_LOOP_TICK_SEC = 300  # check every 5 min if it's run-window time
+SWING_MAX_ALERTS = 10      # cap: send only the N highest-confidence BUY/SELL signals per run
+SWING_MIN_CONFIDENCE = 75  # floor: drop signals below this (75% = 3+ of 4 indicators agree)
 
 
 async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -795,8 +797,9 @@ async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "✅ Swing alerts *ON*.\n\n"
             "Every trading day around 15:45 IST (after market close), "
-            "I'll run swing analysis and send BUY/SELL signals with entry, "
-            "stop-loss, and targets.\n"
+            f"I'll run swing analysis and send only *high-confidence* BUY/SELL signals "
+            f"(≥{SWING_MIN_CONFIDENCE}% — 3+ of 4 indicators agree, top {SWING_MAX_ALERTS} max) "
+            "with entry, stop-loss, and targets.\n"
             "_HOLD signals are silenced — only actionable BUY/SELL trigger an alert._\n\n"
         )
         if wl_count == 0:
@@ -1166,53 +1169,79 @@ async def _swing_alert_tick(app: Application) -> None:
                     uid,
                     f"🌅 *End-of-Day Swing Run*\n\n"
                     f"Watchlist empty — scanning default universe of "
-                    f"{len(watchlist)} NIFTY 100 + Bank NIFTY stocks.\n"
+                    f"{len(watchlist)} NIFTY 100 + Bank NIFTY stocks, "
+                    f"sending the top {SWING_MAX_ALERTS} by confidence.\n"
                     "Add stocks via `/watch SYMBOL` to scan only those.",
                     parse_mode="Markdown",
                 )
             except Exception as e:
                 logger.warning("swing intro send to %s failed: %s", uid, e)
 
-        sent = 0
+        # Phase 1 — analyze the whole watchlist, collecting actionable signals.
+        # Sending is deferred so we can rank by confidence and cap the volume
+        # (a 104-stock universe can otherwise fire 40+ alerts in one run).
+        candidates: list[dict] = []
+        scanned = 0
         for symbol in watchlist:
             try:
                 result = await asyncio.to_thread(analyze, symbol, "swing")
+                scanned += 1
             except Exception as e:
                 logger.warning("swing analyze failed for %s/%s: %s", uid, symbol, e)
                 await asyncio.sleep(SCAN_PACING_SEC)
                 continue
             if result["signal"] in ("BUY", "SELL"):
-                ts = result.get("trade_setup", {})
-                if ts.get("action") in ("BUY", "SELL"):
-                    subscriptions.log_alert(
-                        category="swing_auto",
-                        user_id=uid,
-                        symbol=result["symbol"],
-                        setup=None,
-                        direction=result["signal"],
-                        entry=ts["entry"],
-                        stop_loss=ts["stop_loss"],
-                        target1=ts["target1"],
-                        target2=ts["target2"],
-                    )
-                msg = (
-                    "📅 *SWING / POSITIONAL* · hold days to weeks\n\n"
-                    "🌅 *End-of-Day Swing Signal*\n\n"
-                    + format_report(result)
-                )
-                try:
-                    await app.bot.send_message(uid, msg, parse_mode="Markdown")
-                    sent += 1
-                except Exception as e:
-                    logger.warning("swing signal send to %s failed: %s", uid, e)
+                candidates.append(result)
             await asyncio.sleep(SCAN_PACING_SEC)  # Angel rate-limit pacing
 
-        # Send a summary so the user knows the run completed even with no signals
+        # Phase 2 — drop low-confidence signals, then rank and keep the strongest N.
+        strong = [r for r in candidates if r.get("confidence", 0) >= SWING_MIN_CONFIDENCE]
+        strong.sort(key=lambda r: r.get("confidence", 0), reverse=True)
+        top = strong[:SWING_MAX_ALERTS]
+
+        # Phase 3 — send the ranked shortlist.
+        sent = 0
+        for rank, result in enumerate(top, start=1):
+            ts = result.get("trade_setup", {})
+            if ts.get("action") in ("BUY", "SELL"):
+                subscriptions.log_alert(
+                    category="swing_auto",
+                    user_id=uid,
+                    symbol=result["symbol"],
+                    setup=None,
+                    direction=result["signal"],
+                    entry=ts["entry"],
+                    stop_loss=ts["stop_loss"],
+                    target1=ts["target1"],
+                    target2=ts["target2"],
+                )
+            msg = (
+                "📅 *SWING / POSITIONAL* · hold days to weeks\n\n"
+                f"🌅 *End-of-Day Swing Signal*  ·  #{rank} of {len(top)}  ·  "
+                f"{result.get('confidence', 0)}% confidence\n\n"
+                + format_report(result)
+            )
+            try:
+                await app.bot.send_message(uid, msg, parse_mode="Markdown")
+                sent += 1
+            except Exception as e:
+                logger.warning("swing signal send to %s failed: %s", uid, e)
+
+        # Summary so the user knows the run completed, even with no signals.
         try:
+            below = len(candidates) - len(strong)   # dropped by confidence floor
+            capped = len(strong) - sent             # dropped by top-N cap
+            drops = []
+            if below:
+                drops.append(f"{below} below {SWING_MIN_CONFIDENCE}% conf")
+            if capped:
+                drops.append(f"{capped} beyond top {SWING_MAX_ALERTS}")
+            extra = f" ({'; '.join(drops)} filtered out)" if drops else ""
             await app.bot.send_message(
                 uid,
-                f"📋 Swing run complete — scanned {len(watchlist)}, "
-                f"sent {sent} BUY/SELL alert(s). HOLDs silenced.",
+                f"📋 Swing run complete — scanned {scanned}, "
+                f"{len(candidates)} actionable, sent {sent} high-confidence{extra}. "
+                "HOLDs silenced.",
             )
         except Exception:
             pass
