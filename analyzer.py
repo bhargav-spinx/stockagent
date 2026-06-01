@@ -5,10 +5,10 @@ Pulls NSE/BSE data and runs technical analysis to generate buy/sell/hold signals
 
 import pandas as pd
 import numpy as np
-import pytz
 from datetime import datetime, time
 
 from data_provider import fetch_data, get_provider_name
+from constants import IST
 
 
 # Per-mode indicator config. Swing = daily candles, slow indicators.
@@ -65,8 +65,7 @@ def normalize_symbol(symbol: str) -> str:
 
 def is_nse_open() -> bool:
     """NSE trading hours: 09:15-15:30 IST, Mon-Fri."""
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
+    now = datetime.now(IST)
     if now.weekday() >= 5:
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
@@ -281,7 +280,7 @@ def analyze(symbol: str, mode: str = "swing") -> dict:
 
     setup = build_trade_setup(df, final, float(last_price), float(atr_val), mode)
 
-    ist_now = datetime.now(pytz.timezone("Asia/Kolkata"))
+    ist_now = datetime.now(IST)
     return {
         "symbol": sym,
         "mode": mode,
@@ -337,6 +336,24 @@ def _format_trade_setup(setup: dict, signal: str) -> list[str]:
     lines.append(f"📏 ATR (volatility): ₹{setup['atr']}")
     lines.append(f"📊 Recent range: ₹{setup['swing_low']} – ₹{setup['swing_high']}")
     return lines
+
+
+def signal_agreement(tip_action: str, bot_signal: str) -> tuple[str, str]:
+    """Compare a tip's action with our signal → (emoji, label).
+    Shared by the DM tip handler and the Telethon channel listener."""
+    if tip_action == bot_signal:
+        return "✅", "Agreement"
+    if bot_signal == "HOLD":
+        return "🟡", "Neutral"
+    return "⚠️", "Conflict"
+
+
+def format_indicator_lines(result: dict, n: int = 4) -> str:
+    """Render the top-n indicator votes as emoji-prefixed lines."""
+    return "\n".join(
+        f"{'🟢' if s == 'BUY' else '🔴' if s == 'SELL' else '🟡'} {name}: {r}"
+        for name, s, r in result["indicators"][:n]
+    )
 
 
 def format_report(result: dict) -> str:

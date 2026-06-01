@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, time as dt_time
 from typing import Iterable
 
 import pandas as pd
-import pytz
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -36,9 +35,9 @@ from scanner_setups import detect_setup_a, detect_setup_b, detect_setup_c, Signa
 from universe import TIER1_WATCHLIST  # noqa: E402
 import eod_report  # noqa: E402
 from eod_report import COST_PER_TRADE_PCT  # noqa: E402
+from constants import IST  # noqa: E402
 
 logger = logging.getLogger(__name__)
-IST = pytz.timezone("Asia/Kolkata")
 
 # Min candles required before any setup can fire (indicator warm-up)
 MIN_WARMUP_CANDLES = 30

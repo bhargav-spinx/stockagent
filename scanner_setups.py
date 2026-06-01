@@ -7,17 +7,13 @@ Phase B (next): Setup B (VWAP Pullback) and Setup C (Range Reversal).
 from dataclasses import dataclass, field
 
 import pandas as pd
-import pytz
 
-from analyzer import atr as atr_fn, rsi as rsi_fn
-from scanner_indicators import vwap, ema, swing_low, swing_high
+from analyzer import rsi as rsi_fn
+from scanner_indicators import vwap, ema, today_session, orb_levels, trade_levels
 
-IST = pytz.timezone("Asia/Kolkata")
-
-# Per-leg targets and SL distance, from §7 of STRATEGY.md
-T1_PCT = 0.01   # 1%
-T2_PCT = 0.02   # 2%
-ATR_SL_MULT = 1.5
+# Entry/SL/target levels come from the canonical model in
+# scanner_indicators.trade_levels (ATR-sized stop, R:R 1:2 / 1:3) — shared with
+# the scoring engine so the same stock yields the same levels on every path.
 
 
 @dataclass
@@ -33,30 +29,13 @@ class Signal:
     notes: str = ""
 
 
-def _today_session(df: pd.DataFrame) -> pd.DataFrame:
-    """Return only candles from today's IST session (last unique date)."""
-    if df.index.tz is None:
-        df = df.tz_localize(IST)
-    elif str(df.index.tz) != str(IST):
-        df = df.tz_convert(IST)
-    last_date = df.index[-1].date()
-    return df[df.index.date == last_date]
-
-
-def _compute_sl(df: pd.DataFrame, entry: float, direction: str) -> float:
-    """
-    SL per §7: max(swing-based, ATR-based) for long, min for short.
-    Whichever is tighter (less distance to entry) wins.
-    """
-    atr_val = float(atr_fn(df, 14).iloc[-1])
-    if direction == "long":
-        sl_swing = swing_low(df, lookback=5)
-        sl_atr = entry - ATR_SL_MULT * atr_val
-        return max(sl_swing, sl_atr)  # tighter = closer to entry = larger value
-    else:
-        sl_swing = swing_high(df, lookback=5)
-        sl_atr = entry + ATR_SL_MULT * atr_val
-        return min(sl_swing, sl_atr)
+def signal_metrics(sig: "Signal") -> tuple[float, float, float, float]:
+    """(risk, rr1, rr2, sl_pct) for a Signal — shared by every formatter."""
+    risk = abs(sig.entry - sig.stop_loss)
+    rr1 = abs(sig.target1 - sig.entry) / risk if risk > 0 else 0
+    rr2 = abs(sig.target2 - sig.entry) / risk if risk > 0 else 0
+    sl_pct = ((sig.stop_loss - sig.entry) / sig.entry) * 100 if sig.entry else 0
+    return risk, rr1, rr2, sl_pct
 
 
 def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
@@ -72,13 +51,11 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
         3. RSI(14) in 55–70 (long) / 30–45 (short)
     - Skip if ORB range > 1.2% of stock price.
     """
-    today = _today_session(df)
+    today = today_session(df)
     if len(today) < 4:  # need ORB (3 candles) + at least one trigger candle
         return None
 
-    orb = today.iloc[:3]
-    orb_high = float(orb["High"].max())
-    orb_low = float(orb["Low"].min())
+    orb_high, orb_low = orb_levels(today, 3)
     orb_range_pct = (orb_high - orb_low) / orb_low
 
     if orb_range_pct > 0.012:
@@ -106,13 +83,13 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
             confluences.append(f"RSI {rsi_val:.0f} in 55–70 zone")
 
         if len(confluences) >= 3:
-            sl = _compute_sl(df, last_price, "long")
+            sl, t1, t2 = trade_levels(last_price, "long", df)
             return Signal(
                 symbol=symbol, setup="A", direction="long",
                 entry=last_price,
                 stop_loss=sl,
-                target1=last_price * (1 + T1_PCT),
-                target2=last_price * (1 + T2_PCT),
+                target1=t1,
+                target2=t2,
                 confluences=confluences,
                 notes=notes,
             )
@@ -128,13 +105,13 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
             confluences.append(f"RSI {rsi_val:.0f} in 30–45 zone")
 
         if len(confluences) >= 3:
-            sl = _compute_sl(df, last_price, "short")
+            sl, t1, t2 = trade_levels(last_price, "short", df)
             return Signal(
                 symbol=symbol, setup="A", direction="short",
                 entry=last_price,
                 stop_loss=sl,
-                target1=last_price * (1 - T1_PCT),
-                target2=last_price * (1 - T2_PCT),
+                target1=t1,
+                target2=t2,
                 confluences=confluences,
                 notes=notes,
             )

@@ -6,12 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, time
 
 import pandas as pd
-import pytz
 
 from analyzer import atr as atr_fn
-from scanner_indicators import vwap, vwap_slope_pct
-
-IST = pytz.timezone("Asia/Kolkata")
+from scanner_indicators import vwap, vwap_slope_pct, volume_ratio
+from constants import IST
 
 
 @dataclass
@@ -78,11 +76,12 @@ def trigger_volume_filter(df: pd.DataFrame, ratio: float = 1.5) -> FilterResult:
     """Trigger candle volume ≥ ratio × avg of last 12 candles' volume."""
     if len(df) < 13:
         return FilterResult(False, "Need 13+ candles for volume baseline")
-    cur = df["Volume"].iloc[-1]
-    avg = df["Volume"].iloc[-13:-1].mean()
-    if avg <= 0:
+    r = volume_ratio(df)        # shared formula: cur ÷ avg(prior 12)
+    if r is None:
         return FilterResult(False, "Zero avg-volume baseline")
-    if cur < avg * ratio:
+    if r < ratio:
+        cur = df["Volume"].iloc[-1]
+        avg = df["Volume"].iloc[-13:-1].mean()
         return FilterResult(False,
                             f"Trigger volume {cur:.0f} < {ratio}× avg ({avg*ratio:.0f})")
     return FilterResult(True)

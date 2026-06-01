@@ -8,10 +8,9 @@ import os
 import logging
 from datetime import datetime, time as dt_time
 
-import pytz
 from dotenv import load_dotenv
 
-IST = pytz.timezone("Asia/Kolkata")
+from constants import IST
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -37,9 +36,16 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from analyzer import analyze, format_report, normalize_symbol
+from analyzer import (
+    analyze, format_report, normalize_symbol,
+    signal_agreement, format_indicator_lines,
+)
 from data_provider import force_angel_login, angel_session_active, get_provider_name
-from scanner import scan_many, format_signal_telegram, SCAN_PACING_SEC, TIER1_WATCHLIST
+from scanner import (
+    scan_many, format_signal_telegram, SCAN_PACING_SEC, TIER1_WATCHLIST,
+    score_one, score_many,
+)
+import intraday_score
 from scanner_filters import is_intraday_entry_window
 from universe import INTRADAY_UNIVERSE, SWING_UNIVERSE
 import subscriptions
@@ -318,6 +324,37 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /score SYMBOL [SYMBOL...] — 100-point intraday scorecard
+    (gap, RVOL, VWAP, EMA, ORB, volume breakout). Max 5 per request.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/score RELIANCE` — 100-point intraday scorecard.\n"
+            "Add up to 5 symbols: `/score RELIANCE TCS INFY`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbols = [a.upper() for a in context.args[:5]]
+    await update.message.reply_text(f"📊 Scoring {len(symbols)} symbol(s)…")
+
+    # Market-index trend fetched once and shared across all symbols.
+    idx = await asyncio.to_thread(intraday_score.index_trend)
+    results = await asyncio.to_thread(score_many, symbols, idx)
+
+    for r in results:
+        if r["status"] != "scored":
+            await update.message.reply_text(f"❌ `{r['symbol']}` — {r['reason']}",
+                                            parse_mode="Markdown")
+            continue
+        await update.message.reply_text(
+            intraday_score.format_scorecard(r["scorecard"]),
+            parse_mode="Markdown",
+        )
+
+
 async def mywatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     watchlist = subscriptions.get_watchlist(user_id)
@@ -414,30 +451,19 @@ def _format_tip_summary(tip: dict) -> str:
 def _agreement_verdict(tip: dict, analysis: dict) -> str:
     """Compare tip's action with our analyzer's signal. Return a verdict message."""
     bot_sig = analysis["signal"]
-    bot_conf = analysis["confidence"]
-    sym = analysis["symbol"]
-    rsi = analysis["rsi"]
-
-    if tip["action"] == bot_sig:
-        emoji = "✅"
-        verdict = "*Agreement.* My analysis matches the tip."
-    elif bot_sig == "HOLD":
-        emoji = "🟡"
-        verdict = "*Neutral.* My indicators say HOLD — tip is not contradicted but not confirmed either."
-    else:
-        emoji = "⚠️"
-        verdict = "*Conflict.* The tip and my indicators disagree. Verify the source's track record."
-
-    breakdown = "\n".join(
-        f"{'🟢' if s == 'BUY' else '🔴' if s == 'SELL' else '🟡'} {n}: {r}"
-        for n, s, r in analysis["indicators"][:4]
-    )
+    emoji, label = signal_agreement(tip["action"], bot_sig)
+    detail = {
+        "Agreement": "My analysis matches the tip.",
+        "Neutral": "My indicators say HOLD — tip is not contradicted but not confirmed either.",
+        "Conflict": "The tip and my indicators disagree. Verify the source's track record.",
+    }[label]
+    breakdown = format_indicator_lines(analysis)
     return (
-        f"{emoji} *My analysis of {sym}*\n\n"
-        f"Signal: *{bot_sig}*  ({bot_conf}% confidence)\n"
-        f"RSI: {rsi}\n\n"
+        f"{emoji} *My analysis of {analysis['symbol']}*\n\n"
+        f"Signal: *{bot_sig}*  ({analysis['confidence']}% confidence)\n"
+        f"RSI: {analysis['rsi']}\n\n"
         f"{breakdown}\n\n"
-        f"{verdict}\n\n"
+        f"*{label}.* {detail}\n\n"
         "_Educational only — not financial advice. Verify before trading._"
     )
 
@@ -464,7 +490,7 @@ async def tip_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     text_payload = (msg.text or msg.caption or "").strip()
     photo = msg.photo[-1] if msg.photo else None
 
-    # Build known-tickers universe (NIFTY 100 + Bank NIFTY)
+    # Build known-tickers universe (liquid F&O stocks) for tip matching
     known_tickers = set(INTRADAY_UNIVERSE)
 
     import tip_parser
@@ -510,7 +536,7 @@ async def tip_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text(
             "🤔 Couldn't extract a tip from this message.\n\n"
             "I look for:\n"
-            "• A symbol matching NIFTY 100 + Bank NIFTY (e.g. `RELIANCE`)\n"
+            "• A liquid F&O symbol (e.g. `RELIANCE`)\n"
             "• A clear `BUY` or `SELL` keyword\n"
             "• Optional `Entry`, `Target`, `SL` levels\n\n"
             f"_Example: `{sample}`_",
@@ -602,7 +628,7 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscriptions.subscribe(user_id)
         await update.message.reply_text(
             f"✅ Auto-scan alerts *ON*.\n\n"
-            f"I'll scan {len(INTRADAY_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks "
+            f"I'll scan {len(INTRADAY_UNIVERSE)} liquid F&O stocks "
             f"every 5 minutes during NSE hours (09:30–14:30 IST, excluding "
             f"12:00–13:30 lunch) and ping you when a setup fires.\n\n"
             f"Same setup on same stock won't be re-sent the same day (dedup).\n"
@@ -625,26 +651,33 @@ async def _autoscan_tick(app: Application) -> None:
     if not subs:
         return
 
-    logger.info("autoscan: scanning %d symbols for %d subscriber(s)",
+    logger.info("autoscan: scoring %d symbols for %d subscriber(s)",
                 len(INTRADAY_UNIVERSE), len(subs))
+    # Market-index trend fetched once; shared across all symbols this pass.
+    idx = await asyncio.to_thread(intraday_score.index_trend)
     try:
-        results = await asyncio.to_thread(scan_many, INTRADAY_UNIVERSE)
+        results = await asyncio.to_thread(score_many, INTRADAY_UNIVERSE, idx)
     except Exception as e:
-        logger.exception("autoscan: scan_many crashed: %s", e)
+        logger.exception("autoscan: score_many crashed: %s", e)
         return
 
-    # Aggregate rejection reasons for the quiet-day digest
+    # Aggregate non-qualifying outcomes for the quiet-day digest
     for r in results:
-        if r["status"] == "skip":
-            _bump_rejection(r["reason"])
+        if r["status"] == "scored":
+            c = r["scorecard"]
+            if c.score < intraday_score.STRONG:
+                _bump_rejection(f"{c.rating} (score {c.score})")
+
+    # Only Score ≥ 80 (Strong Buy/Sell) fire alerts — the spec's gate.
+    qualifying = [r["scorecard"] for r in results
+                  if r["status"] == "scored"
+                  and r["scorecard"].score >= intraday_score.STRONG]
+    qualifying.sort(key=lambda c: c.score, reverse=True)
 
     global _today_signals_fired
     new_signals = 0
-    for r in results:
-        if r["status"] != "signal":
-            continue
-        sig = r["signal"]
-        key = subscriptions.signal_key(sig.symbol, sig.setup, sig.direction)
+    for c in qualifying:
+        key = subscriptions.signal_key(c.symbol, "score", c.direction)
         if subscriptions.already_fired(key):
             continue
         subscriptions.mark_fired(key)
@@ -655,16 +688,16 @@ async def _autoscan_tick(app: Application) -> None:
         subscriptions.log_alert(
             category="scan",
             user_id=None,
-            symbol=sig.symbol,
-            setup=sig.setup,
-            direction=sig.direction,
-            entry=sig.entry,
-            stop_loss=sig.stop_loss,
-            target1=sig.target1,
-            target2=sig.target2,
+            symbol=c.symbol,
+            setup=f"score{c.score}",
+            direction=c.direction,
+            entry=c.entry,
+            stop_loss=c.stop_loss,
+            target1=c.target1,
+            target2=c.target2,
         )
 
-        msg = "🔔 *Auto-Signal*\n\n" + format_signal_telegram(sig)
+        msg = "🔔 *Auto-Signal* — Strong Candidate\n\n" + intraday_score.format_scorecard(c)
         for uid in subs:
             try:
                 await app.bot.send_message(uid, msg, parse_mode="Markdown")
@@ -672,7 +705,8 @@ async def _autoscan_tick(app: Application) -> None:
                 logger.warning("autoscan: send to %s failed: %s", uid, e)
 
     if new_signals:
-        logger.info("autoscan: fired %d new signal(s) to %d sub(s)", new_signals, len(subs))
+        logger.info("autoscan: fired %d new strong candidate(s) to %d sub(s)",
+                    new_signals, len(subs))
 
 
 # Quiet-day digest: sent once between 13:00–13:15 IST if no signals fired
@@ -693,7 +727,7 @@ def _format_quiet_digest() -> str:
     top = sorted(_today_rejections.items(), key=lambda x: -x[1])[:5]
     lines = [
         "🌤 *Market quiet so far — 13:00 IST*\n",
-        f"Scanned {len(INTRADAY_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks "
+        f"Scanned {len(INTRADAY_UNIVERSE)} liquid F&O stocks "
         f"every 5 min since 09:30 AM.",
         f"*Zero setups fired in {total_rejections} candle-checks.*\n",
         "*Why candles were rejected:*",
@@ -804,7 +838,7 @@ async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if wl_count == 0:
             msg += (
-                f"📋 *No watchlist set* — defaulting to NIFTY 100 + Bank NIFTY "
+                f"📋 *No watchlist set* — defaulting to all NSE-listed stocks "
                 f"({len(SWING_UNIVERSE)} stocks).\n"
                 f"Add stocks via `/watch SYMBOL` to scan only those instead."
             )
@@ -857,7 +891,7 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
     "intraday": (
         "🟦 *Intraday Alerts (`/scan_alerts`)*\n\n"
         "*What it does:*\n"
-        f"Bot scans {len(INTRADAY_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks every "
+        f"Bot scans {len(INTRADAY_UNIVERSE)} liquid F&O stocks every "
         "5 min during market hours. Pings you when a high-confluence setup fires.\n\n"
         "*Example signal:*\n"
         "```\n"
@@ -891,7 +925,7 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "analysis on stocks and sends BUY/SELL signals.\n\n"
         "*Universe scanned:*\n"
         "• If you've used `/watch SYMBOL` → just those\n"
-        f"• Otherwise → {len(SWING_UNIVERSE)} NIFTY 100 + Bank NIFTY stocks\n\n"
+        f"• Otherwise → all {len(SWING_UNIVERSE)} NSE-listed stocks\n\n"
         "*Example signal:*\n"
         "```\n"
         "🌅 End-of-Day Swing Signal\n"
@@ -1110,7 +1144,7 @@ async def universe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "*📡 Stock universes*\n\n"
         f"*Intraday (`/scan_alerts`)* — fixed:\n"
-        f"  NIFTY 100 + Bank NIFTY = *{intraday_n} stocks*\n"
+        f"  Liquid F&O stocks = *{intraday_n} stocks*\n"
         f"  Sample: {intraday_sample}…\n\n"
         f"*Swing (`/swing_alerts`)*:\n"
     )
@@ -1121,7 +1155,7 @@ async def universe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         msg += (
-            f"  Watchlist empty → defaulting to NIFTY 100 + Bank NIFTY "
+            f"  Watchlist empty → defaulting to all NSE-listed stocks "
             f"= *{swing_n} stocks*\n"
             "  Add personal stocks via `/watch SYMBOL` to override.\n"
         )
@@ -1168,8 +1202,8 @@ async def _swing_alert_tick(app: Application) -> None:
                 await app.bot.send_message(
                     uid,
                     f"🌅 *End-of-Day Swing Run*\n\n"
-                    f"Watchlist empty — scanning default universe of "
-                    f"{len(watchlist)} NIFTY 100 + Bank NIFTY stocks, "
+                    f"Watchlist empty — scanning all "
+                    f"{len(watchlist)} NSE-listed stocks, "
                     f"sending the top {SWING_MAX_ALERTS} by confidence.\n"
                     "Add stocks via `/watch SYMBOL` to scan only those.",
                     parse_mode="Markdown",
@@ -1218,7 +1252,7 @@ async def _swing_alert_tick(app: Application) -> None:
             msg = (
                 "📅 *SWING / POSITIONAL* · hold days to weeks\n\n"
                 f"🌅 *End-of-Day Swing Signal*  ·  #{rank} of {len(top)}  ·  "
-                f"{result.get('confidence', 0)}% confidence\n\n"
+                f"{int(result.get('confidence', 0))}% confidence\n\n"
                 + format_report(result)
             )
             try:
@@ -1230,7 +1264,7 @@ async def _swing_alert_tick(app: Application) -> None:
         # Summary so the user knows the run completed, even with no signals.
         try:
             below = len(candidates) - len(strong)   # dropped by confidence floor
-            capped = len(strong) - sent             # dropped by top-N cap
+            capped = len(strong) - len(top)         # dropped purely by the top-N cap
             drops = []
             if below:
                 drops.append(f"{below} below {SWING_MIN_CONFIDENCE}% conf")
@@ -1375,6 +1409,7 @@ COMMAND_MENU = [
     BotCommand("quickintra", "One-line intraday signal"),
     # Scanner
     BotCommand("scan", "Scan tier-1 watchlist for setups"),
+    BotCommand("score", "100-point intraday scorecard  (e.g. /score TCS)"),
     BotCommand("scan_alerts", "Auto-scan during NSE hours (on/off)"),
     # Swing
     BotCommand("swing_alerts", "End-of-day BUY/SELL alerts (on/off)"),
@@ -1451,6 +1486,7 @@ def main():
 
     # Scanner
     app.add_handler(CommandHandler("scan", scan_cmd))
+    app.add_handler(CommandHandler("score", score_cmd))
     app.add_handler(CommandHandler("scan_alerts", scan_alerts_cmd))
 
     # Swing alerts

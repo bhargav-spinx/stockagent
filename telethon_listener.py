@@ -24,13 +24,24 @@ import os
 from datetime import datetime
 from typing import Optional
 
-import pytz
 from telegram.ext import Application
 
+from constants import IST
+
 logger = logging.getLogger(__name__)
-IST = pytz.timezone("Asia/Kolkata")
 
 SESSION_NAME = "telethon_session"
+
+# --- "Our standard" gate (STRATEGY.md) ---------------------------------------
+# A parsed channel tip is forwarded only if it passes BOTH gates:
+#   1. Swing confidence ≥ SWING_MIN_CONFIDENCE (3+ of 4 daily indicators agree)
+#   2. The §5 universal filters (ATR band, volume, VWAP slope, round-number)
+# Universal filters are intraday entry-mechanics, so we run them with
+# check_time=False — the tip's arrival time is not our entry time. Flip
+# APPLY_UNIVERSAL_FILTERS to False to gate on swing confidence alone.
+SWING_MIN_CONFIDENCE = 75
+APPLY_UNIVERSAL_FILTERS = True
+SUMMARY_EVERY = 10  # emit a pass/drop digest after this many analyzed tips
 
 
 def _enabled() -> bool:
@@ -64,6 +75,12 @@ class TelethonListener:
         self.notify_user_id = _notify_user_id()
         self.message_count = 0
         self.tip_count = 0
+        # Standard-gate tallies (cumulative; window resets after each digest)
+        self.passed_count = 0
+        self.dropped_confidence = 0
+        self.dropped_filters = 0
+        self.dropped_error = 0
+        self._tips_since_summary = 0
         self.started_at: Optional[datetime] = None
 
     async def start(self) -> None:
@@ -145,12 +162,104 @@ class TelethonListener:
             return  # silent — not every channel post is a tip
 
         self.tip_count += 1
-        await self._deliver(channel, tip)
+        await self._evaluate_and_deliver(channel, tip)
 
-    async def _deliver(self, channel: str, tip: dict) -> None:
-        """Send tip extraction + own analysis to the notify user via Bot API."""
-        from analyzer import analyze, format_report
+    async def _evaluate_and_deliver(self, channel: str, tip: dict) -> None:
+        """Apply 'our standard' to a parsed tip; deliver only if it passes.
 
+        Gate 1 — swing confidence ≥ SWING_MIN_CONFIDENCE with a BUY/SELL signal.
+        Gate 2 — §5 universal filters (optional, check_time=False).
+        Dropped tips are silenced but counted into a periodic digest.
+        """
+        from analyzer import analyze, normalize_symbol
+
+        sym = tip["symbol"]
+        direction = "long" if tip["action"] == "BUY" else "short"
+
+        # Gate 1: swing analysis (daily candles).
+        try:
+            result = await asyncio.to_thread(analyze, sym, "swing")
+        except Exception as e:
+            logger.warning("standard gate: analyze failed for %s: %s", sym, e)
+            self.dropped_error += 1
+            await self._maybe_send_digest(channel)
+            return
+
+        conf = result.get("confidence", 0)
+        swing_ok = result["signal"] in ("BUY", "SELL") and conf >= SWING_MIN_CONFIDENCE
+        if not swing_ok:
+            logger.info("standard gate: %s dropped — swing %s @ %s%% (<%s)",
+                        sym, result["signal"], conf, SWING_MIN_CONFIDENCE)
+            self.dropped_confidence += 1
+            await self._maybe_send_digest(channel)
+            return
+
+        # Gate 2: §5 universal filters. check_time=False — the tip's arrival
+        # time is not our entry time, so we validate setup structure only.
+        if APPLY_UNIVERSAL_FILTERS:
+            from data_provider import fetch_data
+            from scanner_filters import apply_universal_filters
+
+            filt_reason = ""
+            filt_ok = False
+            try:
+                df = await asyncio.to_thread(
+                    fetch_data, normalize_symbol(sym), "5d", "5m"
+                )
+                if len(df) < 30:
+                    filt_reason = f"insufficient 5m data ({len(df)} candles)"
+                else:
+                    f = apply_universal_filters(df, direction=direction,
+                                                check_time=False)
+                    filt_ok, filt_reason = f.passed, f.reason
+            except Exception as e:
+                filt_reason = str(e)
+
+            if not filt_ok:
+                logger.info("standard gate: %s dropped — universal filter: %s",
+                            sym, filt_reason)
+                self.dropped_filters += 1
+                await self._maybe_send_digest(channel)
+                return
+
+        # Passed both gates.
+        self.passed_count += 1
+        await self._deliver(channel, tip, result)
+        await self._maybe_send_digest(channel)
+
+    async def _maybe_send_digest(self, channel: str) -> None:
+        """After every SUMMARY_EVERY analyzed tips, send a one-line digest of
+        how the standard gate is performing, then reset the window."""
+        self._tips_since_summary += 1
+        if self._tips_since_summary < SUMMARY_EVERY:
+            return
+        window = self._tips_since_summary
+        self._tips_since_summary = 0
+        drops = []
+        if self.dropped_confidence:
+            drops.append(f"{self.dropped_confidence} low-confidence")
+        if self.dropped_filters:
+            drops.append(f"{self.dropped_filters} failed §5 filters")
+        if self.dropped_error:
+            drops.append(f"{self.dropped_error} errors")
+        detail = f" ({'; '.join(drops)})" if drops else ""
+        try:
+            await self.bot_app.bot.send_message(
+                self.notify_user_id,
+                f"📋 Standard-gate digest — last {window} tips analyzed, "
+                f"{self.passed_count} forwarded, "
+                f"{self.dropped_confidence + self.dropped_filters + self.dropped_error} "
+                f"dropped{detail}. (cumulative since start)",
+            )
+        except Exception as e:
+            logger.warning("digest send failed: %s", e)
+
+    async def _deliver(self, channel: str, tip: dict, result: dict) -> None:
+        """Send tip extraction + own analysis to the notify user via Bot API.
+
+        `result` is the swing analysis already computed by the standard gate,
+        passed in to avoid re-analyzing.
+        """
         arrow = "🟢" if tip["action"] == "BUY" else "🔴"
         lines = [
             f"📡 *Channel tip from @{channel}*\n",
@@ -173,33 +282,24 @@ class TelethonListener:
                           self.notify_user_id, e)
             return
 
-        # Run own analysis
-        try:
-            result = await asyncio.to_thread(analyze, tip["symbol"], "swing")
-        except Exception as e:
-            await self.bot_app.bot.send_message(
-                self.notify_user_id,
-                f"❌ Couldn't analyze {tip['symbol']}: {e}",
-            )
-            return
+        # `result` is the swing analysis from the standard gate (BUY/SELL,
+        # ≥ SWING_MIN_CONFIDENCE) — no need to re-analyze.
+        from analyzer import signal_agreement, format_indicator_lines
 
         bot_sig = result["signal"]
-        if tip["action"] == bot_sig:
-            verdict = "✅ *Agreement.* My analysis matches the channel tip."
-        elif bot_sig == "HOLD":
-            verdict = "🟡 *Neutral.* My indicators say HOLD."
-        else:
-            verdict = "⚠️ *Conflict.* Channel and my indicators disagree."
+        emoji, label = signal_agreement(tip["action"], bot_sig)
+        detail = {
+            "Agreement": "My analysis matches the channel tip.",
+            "Neutral": "My indicators say HOLD.",
+            "Conflict": "Channel and my indicators disagree.",
+        }[label]
 
         msg = (
             f"🔍 *My analysis of {result['symbol']}*\n\n"
             f"Signal: *{bot_sig}*  ({result['confidence']}% confidence)\n"
             f"RSI: {result['rsi']}\n\n"
-            + "\n".join(
-                f"{'🟢' if s == 'BUY' else '🔴' if s == 'SELL' else '🟡'} {n}: {r}"
-                for n, s, r in result["indicators"][:4]
-            )
-            + f"\n\n{verdict}\n\n_Educational only._"
+            + format_indicator_lines(result)
+            + f"\n\n{emoji} *{label}.* {detail}\n\n_Educational only._"
         )
         await self.bot_app.bot.send_message(
             self.notify_user_id, msg, parse_mode="Markdown"

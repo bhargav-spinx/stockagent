@@ -28,8 +28,9 @@ import ssl_dev  # noqa: E402
 ssl_dev.install_if_enabled()
 
 from data_provider import fetch_data  # noqa: E402
+from analyzer import normalize_symbol  # noqa: E402
 from scanner_filters import apply_universal_filters  # noqa: E402
-from scanner_setups import ALL_DETECTORS, Signal  # noqa: E402
+from scanner_setups import ALL_DETECTORS, Signal, signal_metrics  # noqa: E402
 from universe import (  # noqa: E402
     INTRADAY_UNIVERSE,
     SWING_UNIVERSE,
@@ -40,8 +41,9 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize(symbol: str) -> str:
-    s = symbol.upper().strip()
-    return s if "." in s else f"{s}.NS"
+    """Normalize a ticker for fetching — delegates to the single source in
+    analyzer (handles index aliases, .NS default, .BO / ^ passthrough)."""
+    return normalize_symbol(symbol)
 
 
 def scan_one(symbol: str, check_time: bool = True) -> dict:
@@ -83,30 +85,60 @@ def scan_one(symbol: str, check_time: bool = True) -> dict:
     return {"symbol": sym, "status": "no_setup"}
 
 
+def score_one(symbol: str, idx_trend: dict | None = None) -> dict:
+    """Score a single symbol with the 100-point intraday model.
+    Returns {"symbol", "status": "scored", "scorecard": ScoreCard}
+    or {"symbol", "status": "error", "reason": str}."""
+    import intraday_score
+
+    sym = _normalize(symbol)
+    try:
+        df = fetch_data(sym, period="5d", interval="5m")
+    except Exception as e:
+        return {"symbol": sym, "status": "error", "reason": str(e)}
+    if len(df) < 30:
+        return {"symbol": sym, "status": "error",
+                "reason": f"Insufficient data ({len(df)} candles)"}
+    try:
+        card = intraday_score.score_stock(df, sym, idx_trend=idx_trend)
+    except Exception as e:
+        return {"symbol": sym, "status": "error", "reason": str(e)}
+    return {"symbol": sym, "status": "scored", "scorecard": card}
+
+
 # Angel historical-data rate limit ~3 req/sec. Pace at 0.5s between calls
 # to leave headroom and avoid the cascade of 429 retries we hit at full speed.
 SCAN_PACING_SEC = 0.5
 
 
-def scan_many(symbols: Iterable[str], check_time: bool = True,
-              pacing_sec: float = SCAN_PACING_SEC) -> list[dict]:
-    """Scan symbols sequentially, sleeping briefly between calls to respect Angel rate limits."""
+def _paced_map(fn, symbols: Iterable[str], pacing_sec: float) -> list[dict]:
+    """Apply `fn` to each symbol sequentially, sleeping `pacing_sec` between
+    calls to respect Angel's rate limit. Shared by scan_many / score_many."""
     results = []
     syms = list(symbols)
     for i, sym in enumerate(syms):
-        results.append(scan_one(sym, check_time=check_time))
+        results.append(fn(sym))
         if pacing_sec > 0 and i < len(syms) - 1:
             time.sleep(pacing_sec)
     return results
 
 
+def score_many(symbols: Iterable[str], idx_trend: dict | None = None,
+               pacing_sec: float = SCAN_PACING_SEC) -> list[dict]:
+    """Score symbols sequentially, pacing between Angel calls."""
+    return _paced_map(lambda s: score_one(s, idx_trend=idx_trend), symbols, pacing_sec)
+
+
+def scan_many(symbols: Iterable[str], check_time: bool = True,
+              pacing_sec: float = SCAN_PACING_SEC) -> list[dict]:
+    """Scan symbols sequentially, sleeping briefly between calls to respect Angel rate limits."""
+    return _paced_map(lambda s: scan_one(s, check_time=check_time), symbols, pacing_sec)
+
+
 def format_signal(sig: Signal) -> str:
     """Plain-text format for terminal output."""
-    risk = abs(sig.entry - sig.stop_loss)
-    rr1 = abs(sig.target1 - sig.entry) / risk if risk > 0 else 0
-    rr2 = abs(sig.target2 - sig.entry) / risk if risk > 0 else 0
+    _, rr1, rr2, sl_pct = signal_metrics(sig)
     arrow = "🟢 LONG" if sig.direction == "long" else "🔴 SHORT"
-    sl_pct = ((sig.stop_loss - sig.entry) / sig.entry) * 100
     return (
         f"\n📈 SETUP {sig.setup} — {sig.symbol}  {arrow}\n"
         f"   Entry: ₹{sig.entry:.2f}\n"
@@ -121,13 +153,10 @@ def format_signal(sig: Signal) -> str:
 
 def format_signal_telegram(sig: Signal) -> str:
     """Markdown format for Telegram messages."""
-    risk = abs(sig.entry - sig.stop_loss)
-    rr1 = abs(sig.target1 - sig.entry) / risk if risk > 0 else 0
-    rr2 = abs(sig.target2 - sig.entry) / risk if risk > 0 else 0
+    _, rr1, rr2, sl_pct = signal_metrics(sig)
     # Direction shown as both color and plain action verb to avoid jargon
     action = "BUY" if sig.direction == "long" else "SELL-SHORT"
     arrow = f"🟢 *{action}*" if sig.direction == "long" else f"🔴 *{action}*"
-    sl_pct = ((sig.stop_loss - sig.entry) / sig.entry) * 100
     confluences = "\n".join(f"• {c}" for c in sig.confluences)
     return (
         f"⏱ *INTRADAY* · same-day exit by 3:15 PM\n\n"

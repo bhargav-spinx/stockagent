@@ -29,9 +29,9 @@ import pytz
 
 import subscriptions
 from data_provider import fetch_data
+from constants import IST
 
 logger = logging.getLogger(__name__)
-IST = pytz.timezone("Asia/Kolkata")
 
 # STRATEGY.md §8 cost model: ~0.05% brokerage/STT per side + ~0.05% slippage
 # entry + ~0.03% slippage exit ≈ 0.13% round-trip on tier-1 NSE stocks.

@@ -14,11 +14,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import pytz
+
+from constants import IST
 
 logger = logging.getLogger(__name__)
-
-IST = pytz.timezone("Asia/Kolkata")
 
 # ---------- Angel One adapter ----------
 
