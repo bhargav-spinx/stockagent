@@ -1,15 +1,17 @@
 name: Deploy to VM
 
-# Auto-deploy on every push to main (and a manual button). SSHes into the GCP
-# VM, fast-forwards the code to this commit, and runs deploy/deploy.sh
+# Auto-deploy on every push to main (and a manual button). Authenticates to
+# Google Cloud, SSHes into the VM THROUGH IAP (no public IP / no port 22 open to
+# the internet), fast-forwards the code, and runs deploy/deploy.sh
 # (pip-install-if-changed -> restart stockbot -> health check).
 #
 # Required repo secrets (Settings -> Secrets and variables -> Actions):
-#   VM_HOST      public IP / hostname of the VM
-#   VM_USER      SSH user (e.g. ladanibhargav)
-#   VM_SSH_KEY   private SSH key whose public half is in the VM's authorized_keys
-#   VM_SSH_PORT  (optional) SSH port, defaults to 22
-# See deploy/README.md for the one-time VM setup.
+#   GCP_SA_KEY    JSON key of a service account with the roles in deploy/README.md
+#   VM_INSTANCE   instance name (e.g. stockbot)
+#   VM_ZONE       instance zone (e.g. us-central1-a)
+#   VM_USER       SSH/login user on the VM (e.g. ladanibhargav)
+#   GCP_PROJECT   (optional) project id, if not inferable from the SA key
+# See deploy/README.md for the one-time GCP setup.
 
 on:
   push:
@@ -25,17 +27,20 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          port: ${{ secrets.VM_SSH_PORT || 22 }}
-          command_timeout: 10m
-          script: |
-            set -euo pipefail
-            cd ~/stockagent
-            git fetch origin main
-            git reset --hard origin/main
-            bash deploy/deploy.sh
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+
+      - name: Deploy via IAP SSH
+        run: |-
+          gcloud compute ssh "${{ secrets.VM_USER }}@${{ secrets.VM_INSTANCE }}" \
+            --zone="${{ secrets.VM_ZONE }}" \
+            --tunnel-through-iap \
+            --quiet \
+            --command='set -euo pipefail; cd ~/stockagent && git fetch origin main && git reset --hard origin/main && bash deploy/deploy.sh'
