@@ -14,8 +14,8 @@ name: Deploy to VM
 # See deploy/README.md for the one-time GCP setup.
 
 on:
-  push:
-    branches: [main]
+  # Manual-only — auto-deploy on push is disabled (deploys are done by hand).
+  # To re-enable auto-deploy, add a `push:` trigger here with `branches: [main]`.
   workflow_dispatch: {}
 
 # Never run two deploys at once; if a newer push arrives, cancel the in-flight one.
