@@ -185,10 +185,13 @@ def index_trend(aliases=("NIFTY", "BANKNIFTY")) -> dict:
 # ----------------------------------------------------------------------------
 def score_stock(df: pd.DataFrame, symbol: str,
                 idx_trend: dict | None = None,
-                daily_df: pd.DataFrame | None = None) -> ScoreCard:
+                daily_df: pd.DataFrame | None = None,
+                skip_external: bool = False) -> ScoreCard:
     """Score one stock from its 5-min DataFrame (period≈5d). `idx_trend` is an
     optional dict from index_trend(); `daily_df` (1y daily) enables the 52-week
-    proximity note. Always returns a ScoreCard (rating 'Avoid' on thin data)."""
+    proximity note. `skip_external=True` skips the live NSE delivery %/earnings
+    lookups (keeps backtests hermetic/offline). Always returns a ScoreCard
+    (rating 'Avoid' on thin data)."""
     df = localize_ist(df)
     price = float(df["Close"].iloc[-1])
     today_df, priors = split_sessions(df)
@@ -344,23 +347,26 @@ def score_stock(df: pd.DataFrame, symbol: str,
         elif lo52 > 0 and (price - lo52) / lo52 <= 0.03:
             context.append("Near 52-week low")
 
-    # Delivery % (cached daily NSE bhavcopy) — accumulation vs intraday churn.
-    deliv = _delivery_pct(symbol)
-    if deliv is not None:
-        context.append(f"Delivery: {deliv:.0f}%")
-        if deliv >= 60:
-            context.append("strong delivery")
-        elif deliv < 25:
-            notes.append("Low delivery % — intraday churn, weak conviction")
-
-    # Earnings proximity (cached daily NSE calendar) — event risk. A positive
-    # hit within 2 days flips event_ok so the alert layer can suppress the trade.
+    # External context (live NSE) — skipped in backtests to stay offline.
+    deliv = None
     event_ok = True
-    dte = _days_to_earnings(symbol)
-    if dte is not None and 0 <= dte <= 2:
-        event_ok = False
-        when = "today" if dte == 0 else f"in {dte}d"
-        notes.append(f"Earnings {when} — event risk")
+    if not skip_external:
+        # Delivery % (cached daily NSE bhavcopy) — accumulation vs intraday churn.
+        deliv = _delivery_pct(symbol)
+        if deliv is not None:
+            context.append(f"Delivery: {deliv:.0f}%")
+            if deliv >= 60:
+                context.append("strong delivery")
+            elif deliv < 25:
+                notes.append("Low delivery % — intraday churn, weak conviction")
+
+        # Earnings proximity (cached daily NSE calendar) — event risk. A hit
+        # within 2 days flips event_ok so the alert layer can suppress the trade.
+        dte = _days_to_earnings(symbol)
+        if dte is not None and 0 <= dte <= 2:
+            event_ok = False
+            when = "today" if dte == 0 else f"in {dte}d"
+            notes.append(f"Earnings {when} — event risk")
 
     return ScoreCard(
         symbol=symbol, price=price, direction=direction, score=score,

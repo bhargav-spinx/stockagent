@@ -337,7 +337,9 @@ def backtest_symbol_score(symbol: str, days: int = 90,
         if ts.date() in fired_days:
             continue
         try:
-            card = intraday_score.score_stock(slice_df, sym)
+            # skip_external: no live NSE delivery/earnings calls — keep the
+            # backtest hermetic (and those inputs are today's, not historical).
+            card = intraday_score.score_stock(slice_df, sym, skip_external=True)
         except Exception:
             continue
         if card.direction == "none" or card.score < min_score:
