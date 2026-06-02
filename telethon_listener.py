@@ -26,7 +26,7 @@ from typing import Optional
 
 from telegram.ext import Application
 
-from constants import IST
+from constants import IST, SWING_MIN_CONFIDENCE
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +34,13 @@ SESSION_NAME = "telethon_session"
 
 # --- "Our standard" gate (STRATEGY.md) ---------------------------------------
 # A parsed channel tip is forwarded only if it passes BOTH gates:
-#   1. Swing confidence ≥ SWING_MIN_CONFIDENCE (3+ of 4 daily indicators agree)
+#   1. Swing confidence ≥ SWING_MIN_CONFIDENCE (near-unanimous daily indicators)
 #   2. The §5 universal filters (ATR band, volume, VWAP slope, round-number)
 # Universal filters are intraday entry-mechanics, so we run them with
 # check_time=False — the tip's arrival time is not our entry time. Flip
 # APPLY_UNIVERSAL_FILTERS to False to gate on swing confidence alone.
-SWING_MIN_CONFIDENCE = 75
+# SWING_MIN_CONFIDENCE is imported from constants.py — same bar as the daily
+# swing scan, so the channel-tip gate never drifts from it.
 APPLY_UNIVERSAL_FILTERS = True
 SUMMARY_EVERY = 10  # emit a pass/drop digest after this many analyzed tips
 
@@ -281,6 +282,30 @@ class TelethonListener:
             logger.warning("Telethon: send to user %s failed: %s",
                           self.notify_user_id, e)
             return
+
+        # Persist the forwarded tip as a tracked trade (#5) so it resolves and
+        # appears in the EOD report, swing-completion DMs and /stats — giving
+        # each channel an accountable scorecard. We log OUR levels (the standard-
+        # gate analysis), not the channel's, so tracking is consistent.
+        from analyzer import normalize_symbol
+        ts = result.get("trade_setup") or {}
+        if ts.get("action") in ("BUY", "SELL") and all(
+            ts.get(k) is not None for k in ("entry", "stop_loss", "target1", "target2")
+        ):
+            try:
+                import subscriptions
+                subscriptions.log_alert(
+                    category="channel_tip",
+                    user_id=self.notify_user_id,
+                    symbol=normalize_symbol(result["symbol"]),
+                    setup=f"@{channel}",
+                    direction="long" if ts["action"] == "BUY" else "short",
+                    entry=ts["entry"], stop_loss=ts["stop_loss"],
+                    target1=ts["target1"], target2=ts["target2"],
+                )
+            except Exception as e:
+                logger.warning("channel tip log_alert failed for %s: %s",
+                               result.get("symbol"), e)
 
         # `result` is the swing analysis from the standard gate (BUY/SELL,
         # ≥ SWING_MIN_CONFIDENCE) — no need to re-analyze.

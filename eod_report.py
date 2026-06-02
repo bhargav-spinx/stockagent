@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 COST_PER_TRADE_PCT = 0.13
 
 INTRADAY_CATEGORIES = {"scan", "manual_intraday"}
-SWING_CATEGORIES = {"swing_auto", "manual_swing"}
+# Channel tips are analysed on daily candles (swing horizon), so they resolve
+# and report through the swing machinery.
+SWING_CATEGORIES = {"swing_auto", "manual_swing", "channel_tip"}
 
 PASS_STATUSES = {"t2_hit", "t1_then_squareoff", "t1_then_breakeven"}
 FAIL_STATUSES = {"sl_hit"}
@@ -379,8 +381,7 @@ def build_report(user_id: int | None = None,
 
     scan_rows = [r for r in all_today if r["category"] == "scan"]
     manual_intraday_rows = [r for r in all_today if r["category"] == "manual_intraday"]
-    swing_rows = [r for r in all_today
-                  if r["category"] in ("swing_auto", "manual_swing")]
+    swing_rows = [r for r in all_today if r["category"] in SWING_CATEGORIES]
 
     parts = [
         f"📊 *End-of-Day Report* — {trade_date_str}\n",
@@ -396,6 +397,86 @@ def build_report(user_id: int | None = None,
         parts.append(_format_empty_day_explanation(today_rejection_stats))
 
     return "\n".join(parts)
+
+
+# ---------- swing-completion notification ----------
+
+# Statuses at which a swing trade is considered finished (vs. still "open").
+SWING_TERMINAL_STATUSES = tuple(PASS_STATUSES | FAIL_STATUSES)
+
+_SWING_HEADLINE = {
+    "t2_hit": "🎯 Target hit — full move captured",
+    "t1_then_squareoff": "🎯 Target 1 hit, rest squared off",
+    "t1_then_breakeven": "🟡 Target 1 hit, trailed out at breakeven",
+    "sl_hit": "🛑 Stop-loss hit",
+}
+
+
+def _hold_days(rec: dict[str, Any]) -> int | None:
+    """Calendar days a swing trade was held: recommendation date → exit date."""
+    exit_t = rec.get("exit_time")
+    if not (isinstance(exit_t, str) and exit_t):
+        return None
+    try:
+        return (_parse_iso(exit_t).date() - _parse_iso(rec["generated_at"]).date()).days
+    except Exception:
+        return None
+
+
+def swing_record_summary(records: list[dict[str, Any]]) -> str:
+    """One-line running performance record from resolved swing alerts."""
+    resolved = [r for r in records if r.get("pnl_pct") is not None]
+    if not resolved:
+        return ""
+    wins = sum(1 for r in resolved if _classify(r.get("status")) == "pass")
+    losses = sum(1 for r in resolved if _classify(r.get("status")) == "fail")
+    neutral = len(resolved) - wins - losses
+    gross = sum(r["pnl_pct"] for r in resolved)
+    net = gross - COST_PER_TRADE_PCT * len(resolved)
+    win_rate = wins / len(resolved) * 100
+    rec = f"{wins}W / {losses}L"
+    if neutral:
+        rec += f" / {neutral}N"
+    holds = [d for d in (_hold_days(r) for r in resolved) if d is not None]
+    hold_str = f"  ·  avg hold {sum(holds) / len(holds):.0f}d" if holds else ""
+    return (f"📈 *Swing record to date:* {rec}  ·  "
+            f"win rate {win_rate:.0f}%  ·  net {net:+.2f}%{hold_str}")
+
+
+def format_swing_completion(rec: dict[str, Any],
+                            record_summary: str | None = None) -> str:
+    """Per-trade message sent when a swing recommendation finishes."""
+    status = rec.get("status")
+    emoji = _STATUS_EMOJI.get(status, "•")
+    sym = rec["symbol"].replace(".NS", "").replace(".BO", "")
+    direction = rec["direction"].upper()
+    headline = _SWING_HEADLINE.get(status, _STATUS_LABEL.get(status, status or "Closed"))
+
+    pnl = rec.get("pnl_pct")
+    exit_p = rec.get("exit_price")
+    gen = _parse_iso(rec["generated_at"]).strftime("%d %b")
+    exit_t = rec.get("exit_time")
+    exit_d = _parse_iso(exit_t).strftime("%d %b") if isinstance(exit_t, str) and exit_t else "—"
+    held = _hold_days(rec)
+    held_str = f"   ·   Held: {held}d" if held is not None else ""
+
+    lines = [
+        f"{emoji} *Swing trade closed — {sym}*  ({direction})",
+        headline,
+        "",
+        f"Recommended: {gen}   ·   Closed: {exit_d}{held_str}",
+        f"Entry: ₹{rec['entry']:.2f}",
+    ]
+    if exit_p is not None:
+        lines.append(f"Exit:  ₹{exit_p:.2f}")
+    if pnl is not None:
+        net = pnl - COST_PER_TRADE_PCT
+        lines.append(f"Result: *{pnl:+.2f}%*  (net ~{net:+.2f}% after ~{COST_PER_TRADE_PCT:.2f}% costs)")
+    if record_summary:
+        lines += ["", record_summary]
+    lines += ["", "_Hypothetical paper-trade outcome, gross of slippage. "
+                  "Educational only — not financial advice._"]
+    return "\n".join(lines)
 
 
 def _format_empty_day_explanation(rejections: dict[str, int]) -> str:

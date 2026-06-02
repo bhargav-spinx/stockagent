@@ -10,7 +10,7 @@ from datetime import datetime, time as dt_time
 
 from dotenv import load_dotenv
 
-from constants import IST
+from constants import IST, SWING_MIN_CONFIDENCE, SWING_MAX_ALERTS
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -50,6 +50,8 @@ from scanner_filters import is_intraday_entry_window
 from universe import INTRADAY_UNIVERSE, SWING_UNIVERSE
 import subscriptions
 import eod_report
+import stats
+import market_context
 from eod_report import COST_PER_TRADE_PCT
 from indices import INDICES, PRIMARY_INDICES, display_name as _index_display_name
 from data_provider import fetch_data as _fetch_data
@@ -349,10 +351,14 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ `{r['symbol']}` — {r['reason']}",
                                             parse_mode="Markdown")
             continue
-        await update.message.reply_text(
-            intraday_score.format_scorecard(r["scorecard"]),
-            parse_mode="Markdown",
-        )
+        card_msg = intraday_score.format_scorecard(r["scorecard"])
+        try:
+            news = await asyncio.to_thread(market_context.news_summary, r["symbol"])
+            if news:
+                card_msg += "\n\n" + news
+        except Exception:
+            pass
+        await update.message.reply_text(card_msg, parse_mode="Markdown")
 
 
 async def mywatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -630,14 +636,22 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Auto-scan alerts *ON*.\n\n"
             f"I'll scan {len(INTRADAY_UNIVERSE)} liquid F&O stocks "
             f"every 5 minutes during NSE hours (09:30–14:30 IST, excluding "
-            f"12:00–13:30 lunch) and ping you when a setup fires.\n\n"
-            f"Same setup on same stock won't be re-sent the same day (dedup).\n"
+            f"12:00–13:30 lunch) and ping you with only the *top {AUTOSCAN_MAX_ALERTS} "
+            f"strongest* setups (score ≥{AUTOSCAN_MIN_SCORE}) each pass.\n\n"
+            f"Same stock won't be re-sent the same day (dedup).\n"
             f"`/scan_alerts off` to stop.",
             parse_mode="Markdown",
         )
     else:
         subscriptions.unsubscribe(user_id)
         await update.message.reply_text("🔕 Auto-scan alerts *OFF*.", parse_mode="Markdown")
+
+
+# Auto-signal gate: only the very strongest setups fire, and only the top few
+# per pass — keeps the channel to a handful of high-conviction calls a day.
+AUTOSCAN_MIN_SCORE = 90    # score floor for an auto-signal (≥90 / 100)
+AUTOSCAN_MAX_ALERTS = 5    # cap: send only the N highest-scoring per pass
+AUTOSCAN_MAX_DAILY = 8     # risk cap: stop firing once this many fired today
 
 
 async def _autoscan_tick(app: Application) -> None:
@@ -665,18 +679,31 @@ async def _autoscan_tick(app: Application) -> None:
     for r in results:
         if r["status"] == "scored":
             c = r["scorecard"]
-            if c.score < intraday_score.STRONG:
+            if c.score < AUTOSCAN_MIN_SCORE:
                 _bump_rejection(f"{c.rating} (score {c.score})")
+            elif not c.regime_ok:
+                _bump_rejection("Counter-trend (suppressed by market regime)")
+            elif not c.event_ok:
+                _bump_rejection("Earnings within 2 days (event risk suppressed)")
 
-    # Only Score ≥ 80 (Strong Buy/Sell) fire alerts — the spec's gate.
+    # Fire only the very strongest setups (≥90) that are WITH the market regime
+    # (#4) and clear of imminent earnings (event risk), top 5 per pass.
     qualifying = [r["scorecard"] for r in results
                   if r["status"] == "scored"
-                  and r["scorecard"].score >= intraday_score.STRONG]
+                  and r["scorecard"].score >= AUTOSCAN_MIN_SCORE
+                  and r["scorecard"].regime_ok
+                  and r["scorecard"].event_ok]
     qualifying.sort(key=lambda c: c.score, reverse=True)
+    qualifying = qualifying[:AUTOSCAN_MAX_ALERTS]
 
     global _today_signals_fired
     new_signals = 0
     for c in qualifying:
+        # Daily risk cap (#6): never fire more than AUTOSCAN_MAX_DAILY a day.
+        if _today_signals_fired >= AUTOSCAN_MAX_DAILY:
+            logger.info("autoscan: daily cap (%d) reached — suppressing further signals",
+                        AUTOSCAN_MAX_DAILY)
+            break
         key = subscriptions.signal_key(c.symbol, "score", c.direction)
         if subscriptions.already_fired(key):
             continue
@@ -698,6 +725,15 @@ async def _autoscan_tick(app: Application) -> None:
         )
 
         msg = "🔔 *Auto-Signal* — Strong Candidate\n\n" + intraday_score.format_scorecard(c)
+        # Enrich ONLY fired alerts with live news (Marketaux, rate-limited) —
+        # never the universe scan. ≤ AUTOSCAN_MAX_DAILY/day keeps us well under
+        # the 100 req/day budget. Degrades silently if unavailable.
+        try:
+            news = await asyncio.to_thread(market_context.news_summary, c.symbol)
+            if news:
+                msg += "\n\n" + news
+        except Exception as e:
+            logger.warning("autoscan: news enrich for %s failed: %s", c.symbol, e)
         for uid in subs:
             try:
                 await app.bot.send_message(uid, msg, parse_mode="Markdown")
@@ -803,8 +839,8 @@ async def _autoscan_loop(app: Application) -> None:
 # Run once per trading day in this window
 SWING_RUN_WINDOW = (dt_time(15, 45), dt_time(16, 15))
 SWING_LOOP_TICK_SEC = 300  # check every 5 min if it's run-window time
-SWING_MAX_ALERTS = 10      # cap: send only the N highest-confidence BUY/SELL signals per run
-SWING_MIN_CONFIDENCE = 75  # floor: drop signals below this (75% = 3+ of 4 indicators agree)
+# SWING_MAX_ALERTS / SWING_MIN_CONFIDENCE come from constants.py (shared with
+# the channel-tip standard gate so both apply the same bar).
 
 
 async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -832,7 +868,7 @@ async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Swing alerts *ON*.\n\n"
             "Every trading day around 15:45 IST (after market close), "
             f"I'll run swing analysis and send only *high-confidence* BUY/SELL signals "
-            f"(≥{SWING_MIN_CONFIDENCE}% — 3+ of 4 indicators agree, top {SWING_MAX_ALERTS} max) "
+            f"(≥{SWING_MIN_CONFIDENCE}% — near-unanimous indicators, top {SWING_MAX_ALERTS} max) "
             "with entry, stop-loss, and targets.\n"
             "_HOLD signals are silenced — only actionable BUY/SELL trigger an alert._\n\n"
         )
@@ -1330,6 +1366,19 @@ async def eod_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔕 EOD report *OFF*.", parse_mode="Markdown")
 
 
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Realized win-rate / P&L of every recommendation the bot has made,
+    sliced by type, intraday score bucket, and channel."""
+    await update.message.reply_text("📈 Crunching outcomes…")
+    try:
+        report = await asyncio.to_thread(stats.build_stats_report)
+    except Exception as e:
+        logger.exception("stats_cmd failed: %s", e)
+        await update.message.reply_text(f"❌ Stats build failed: {e}")
+        return
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """On-demand EOD report for the calling user."""
     await update.message.reply_text("📊 Building report — resolving outcomes…")
@@ -1396,6 +1445,131 @@ async def _eod_report_loop(app: Application) -> None:
         await asyncio.sleep(EOD_LOOP_TICK_SEC)
 
 
+# ---------- Swing-trade completion notifier ----------
+# Swing calls span days. Once a day after close we resolve open trades and push
+# a final-result message to whoever received each call the moment it finishes
+# (target / SL / breakeven), plus their running swing record. Runs after the EOD
+# window so daily candles are settled; the per-outcome `notified` flag guarantees
+# exactly-once delivery even across restarts.
+SWING_OUTCOME_WINDOW = (dt_time(16, 10), dt_time(16, 40))
+
+
+def _is_swing_outcome_window(now: datetime | None = None) -> bool:
+    now = now or datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return SWING_OUTCOME_WINDOW[0] <= now.time() < SWING_OUTCOME_WINDOW[1]
+
+
+def _swing_outcome_run_key(d: datetime | None = None) -> str:
+    d = d or datetime.now(IST)
+    return f"swing_outcome:{d.date().isoformat()}"
+
+
+async def _swing_outcome_tick(app: Application) -> None:
+    if not _is_swing_outcome_window():
+        return
+    key = _swing_outcome_run_key()
+    if subscriptions.already_fired(key):
+        return  # already resolved today
+    subscriptions.mark_fired(key)
+
+    # Resolve every open alert (idempotent); we only notify on swing completions.
+    try:
+        await asyncio.to_thread(eod_report.resolve_pending)
+    except Exception as e:
+        logger.exception("swing outcome: resolve_pending failed: %s", e)
+        # Still try to push any already-resolved-but-unnotified trades below.
+
+    cats = tuple(eod_report.SWING_CATEGORIES)
+    pending = await asyncio.to_thread(
+        subscriptions.get_unnotified_resolved, cats,
+        eod_report.SWING_TERMINAL_STATUSES,
+    )
+    if not pending:
+        return
+
+    logger.info("swing outcome: %d completed trade(s) to notify", len(pending))
+    for rec in pending:
+        uid = rec["user_id"]
+        try:
+            history = await asyncio.to_thread(subscriptions.get_resolved_alerts, cats, uid)
+            summary = eod_report.swing_record_summary(history)
+            msg = eod_report.format_swing_completion(rec, summary)
+            await app.bot.send_message(uid, msg, parse_mode="Markdown")
+            subscriptions.mark_outcome_notified(rec["id"])  # only after a successful send
+        except Exception as e:
+            logger.warning("swing outcome send to %s failed: %s", uid, e)
+
+
+async def _swing_outcome_loop(app: Application) -> None:
+    logger.info("swing outcome loop started (window %s–%s IST)",
+                SWING_OUTCOME_WINDOW[0], SWING_OUTCOME_WINDOW[1])
+    while True:
+        try:
+            await _swing_outcome_tick(app)
+        except Exception as e:
+            logger.exception("swing outcome tick failed: %s", e)
+        await asyncio.sleep(EOD_LOOP_TICK_SEC)
+
+
+# ---------- Health heartbeat (#7) ----------
+# Once each trading morning we log liveness + data-provider health and, only if
+# the feed is degraded, warn subscribers (so silence never means "all good" when
+# the bot is actually blind). Alert-on-problem, not a daily "I'm alive" spam.
+HEARTBEAT_WINDOW = (dt_time(9, 0), dt_time(9, 15))
+
+
+def _is_heartbeat_window(now: datetime | None = None) -> bool:
+    now = now or datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return HEARTBEAT_WINDOW[0] <= now.time() < HEARTBEAT_WINDOW[1]
+
+
+async def _heartbeat_tick(app: Application) -> None:
+    if not _is_heartbeat_window():
+        return
+    key = f"heartbeat:{datetime.now(IST).date().isoformat()}"
+    if subscriptions.already_fired(key):
+        return
+    subscriptions.mark_fired(key)
+
+    provider = get_provider_name()
+    active = angel_session_active()
+    logger.info("heartbeat: alive — provider=%s, angel_active=%s", provider, active)
+
+    if not active:
+        try:
+            await asyncio.to_thread(force_angel_login)
+        except Exception as e:
+            logger.warning("heartbeat: Angel re-login failed: %s", e)
+        active = angel_session_active()
+
+    if not active:
+        recipients = set(subscriptions.get_subscribers()) | set(
+            subscriptions.get_swing_subscribers())
+        warn = ("⚠️ *Data feed degraded* — the primary broker session is down "
+                "this morning. Signals may be delayed or use the fallback source. "
+                "I'll keep retrying.")
+        for uid in recipients:
+            try:
+                await app.bot.send_message(uid, warn, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("heartbeat: warn send to %s failed: %s", uid, e)
+
+
+async def _heartbeat_loop(app: Application) -> None:
+    logger.info("heartbeat loop started (window %s–%s IST)",
+                HEARTBEAT_WINDOW[0], HEARTBEAT_WINDOW[1])
+    while True:
+        try:
+            await _heartbeat_tick(app)
+        except Exception as e:
+            logger.exception("heartbeat tick failed: %s", e)
+        await asyncio.sleep(EOD_LOOP_TICK_SEC)
+
+
 # Telegram's /-menu. Shown when user taps the / icon or hovers the bot.
 # Set once in _post_init via bot.set_my_commands().
 COMMAND_MENU = [
@@ -1416,6 +1590,7 @@ COMMAND_MENU = [
     # EOD report
     BotCommand("eod_report", "Daily summary report (on/off)"),
     BotCommand("today", "On-demand EOD report"),
+    BotCommand("stats", "Realized win-rate & P&L of past calls"),
     BotCommand("index", "NIFTY / Bank NIFTY / SENSEX snapshot"),
     BotCommand("universe", "Show scan/swing universes"),
     BotCommand("tg_status", "Telethon channel-listener status"),
@@ -1440,6 +1615,8 @@ async def _post_init(app: Application) -> None:
     app.bot_data["autoscan_task"] = asyncio.create_task(_autoscan_loop(app))
     app.bot_data["swing_alert_task"] = asyncio.create_task(_swing_alert_loop(app))
     app.bot_data["eod_report_task"] = asyncio.create_task(_eod_report_loop(app))
+    app.bot_data["swing_outcome_task"] = asyncio.create_task(_swing_outcome_loop(app))
+    app.bot_data["heartbeat_task"] = asyncio.create_task(_heartbeat_loop(app))
 
     # Telethon channel listener (optional — only if TELETHON_* env vars set
     # AND auth_once.py has been run to create telethon_session.session)
@@ -1495,6 +1672,7 @@ def main():
     # EOD report
     app.add_handler(CommandHandler("eod_report", eod_report_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
 
     # Watchlist
     app.add_handler(CommandHandler("watch", watch_cmd))

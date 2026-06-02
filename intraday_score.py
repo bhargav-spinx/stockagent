@@ -63,24 +63,37 @@ class ScoreCard:
     gap_pct: float | None
     rvol: float | None
     orb_window: int | None         # which window (15/30) was used
+    regime_ok: bool = True         # False = trade opposes the market-index regime
+    event_ok: bool = True          # False = earnings/results within 2 days (event risk)
+    delivery_pct: float | None = None
     context: list[str] = field(default_factory=list)   # supertrend, index, 52w
     notes: list[str] = field(default_factory=list)      # warnings / why-avoid
 
 
 # ----------------------------------------------------------------------------
-# Unavailable inputs — stubbed so they are trivial to wire later.
+# External context inputs — wired to market_context (NSE delivery %, NSE results
+# calendar). Both are cached once/day there, so per-symbol use here is cheap.
+# Any failure returns None ('unknown') and the scorer ignores it — never breaks.
+# (Live news is per-symbol + rate-limited, so it enriches only fired alerts in
+# the bot layer, NOT this per-universe scorer.)
 # ----------------------------------------------------------------------------
 def _delivery_pct(symbol: str):
-    """High delivery % filter — NOT available from Angel's OHLCV feed.
-    NSE publishes it EOD in the security-wise delivery file. Returns None
-    until a source is wired; the scorer treats None as 'unknown' (no effect)."""
-    return None
+    """Delivery % from NSE's EOD bhavcopy (cached daily). None = unknown."""
+    try:
+        import market_context
+        return market_context.delivery_pct(symbol)
+    except Exception:
+        return None
 
 
-def _news_trigger(symbol: str):
-    """Strong news / earnings trigger — needs a news/earnings API (none wired).
-    Returns None ('unknown')."""
-    return None
+def _days_to_earnings(symbol: str):
+    """Calendar days to the next scheduled results date (cached daily).
+    0 = today, None = none scheduled / unknown."""
+    try:
+        import market_context
+        return market_context.days_to_earnings(symbol)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -310,12 +323,17 @@ def score_stock(df: pd.DataFrame, symbol: str,
     except Exception:
         pass
 
+    # Market-index regime gate: when every fetched index trends AGAINST the
+    # trade, the setup is counter-trend. regime_ok=False lets the alert layer
+    # suppress it (the score itself is unchanged — only the firing gate cares).
+    regime_ok = True
     idx_trend = idx_trend or {}
     if idx_trend:
         context.append("Index: " + ", ".join(f"{k} {v}" for k, v in idx_trend.items()))
         want = "bullish" if long else "bearish"
-        if idx_trend and all(v != want for v in idx_trend.values()):
-            notes.append(f"Market index not {want} — weaker confirmation")
+        if all(v != want for v in idx_trend.values()):
+            regime_ok = False
+            notes.append(f"Market index not {want} — counter-trend setup")
 
     if daily_df is not None and len(daily_df) >= 30:
         hi52 = float(daily_df["High"].tail(252).max())
@@ -325,12 +343,31 @@ def score_stock(df: pd.DataFrame, symbol: str,
         elif lo52 > 0 and (price - lo52) / lo52 <= 0.03:
             context.append("Near 52-week low")
 
+    # Delivery % (cached daily NSE bhavcopy) — accumulation vs intraday churn.
+    deliv = _delivery_pct(symbol)
+    if deliv is not None:
+        context.append(f"Delivery: {deliv:.0f}%")
+        if deliv >= 60:
+            context.append("strong delivery")
+        elif deliv < 25:
+            notes.append("Low delivery % — intraday churn, weak conviction")
+
+    # Earnings proximity (cached daily NSE calendar) — event risk. A positive
+    # hit within 2 days flips event_ok so the alert layer can suppress the trade.
+    event_ok = True
+    dte = _days_to_earnings(symbol)
+    if dte is not None and 0 <= dte <= 2:
+        event_ok = False
+        when = "today" if dte == 0 else f"in {dte}d"
+        notes.append(f"Earnings {when} — event risk")
+
     return ScoreCard(
         symbol=symbol, price=price, direction=direction, score=score,
         rating=rating, breakdown=breakdown, signals=signals,
         entry=entry, stop_loss=sl, target1=t1, target2=t2,
         bullish_prob=bullish, bearish_prob=bearish,
         gap_pct=gap, rvol=rvol, orb_window=orb_win,
+        regime_ok=regime_ok, event_ok=event_ok, delivery_pct=deliv,
         context=context, notes=notes,
     )
 

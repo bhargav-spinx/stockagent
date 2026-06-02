@@ -86,6 +86,12 @@ def init_db() -> None:
                 FOREIGN KEY (alert_id) REFERENCES alerts_log(id)
             )
         """)
+        # Migration: per-outcome "notified" flag so swing completions are
+        # pushed to the recipient exactly once, regardless of who resolves first.
+        oc_cols = [r[1] for r in c.execute("PRAGMA table_info(alert_outcomes)").fetchall()]
+        if "notified" not in oc_cols:
+            c.execute("ALTER TABLE alert_outcomes ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_signals_date ON fired_signals(trade_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_watch_user ON user_watchlist(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_date ON alerts_log(trade_date)")
@@ -341,3 +347,64 @@ def save_outcome(
              exit_time.isoformat() if exit_time else None,
              pnl_pct, datetime.utcnow().isoformat()),
         )
+
+
+_ALERT_OUTCOME_COLS = [
+    "id", "generated_at", "trade_date", "category", "user_id",
+    "symbol", "setup", "direction", "entry", "stop_loss", "target1", "target2",
+    "status", "exit_price", "exit_time", "pnl_pct", "resolved_at",
+]
+
+
+def get_unnotified_resolved(categories: tuple[str, ...],
+                            statuses: tuple[str, ...]) -> list[dict]:
+    """Resolved alerts (joined with their outcome) that have not yet been
+    pushed to their recipient. Filtered to the given categories + terminal
+    statuses, and to alerts that have an owning user_id. Ordered oldest-first."""
+    cat_ph = ",".join("?" * len(categories))
+    st_ph = ",".join("?" * len(statuses))
+    sql = f"""
+        SELECT a.id, a.generated_at, a.trade_date, a.category, a.user_id,
+               a.symbol, a.setup, a.direction, a.entry, a.stop_loss,
+               a.target1, a.target2,
+               o.status, o.exit_price, o.exit_time, o.pnl_pct, o.resolved_at
+        FROM alerts_log a
+        JOIN alert_outcomes o ON o.alert_id = a.id
+        WHERE o.notified = 0
+          AND a.user_id IS NOT NULL
+          AND a.category IN ({cat_ph})
+          AND o.status IN ({st_ph})
+        ORDER BY o.resolved_at
+    """
+    with _conn() as c:
+        rows = c.execute(sql, (*categories, *statuses)).fetchall()
+    return [dict(zip(_ALERT_OUTCOME_COLS, row)) for row in rows]
+
+
+def mark_outcome_notified(alert_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE alert_outcomes SET notified = 1 WHERE alert_id = ?", (alert_id,))
+
+
+def get_resolved_alerts(categories: tuple[str, ...],
+                        user_id: int | None = None) -> list[dict]:
+    """All resolved alerts (joined with outcome) for the given categories,
+    optionally scoped to one recipient. Used for the running performance record."""
+    cat_ph = ",".join("?" * len(categories))
+    sql = f"""
+        SELECT a.id, a.generated_at, a.trade_date, a.category, a.user_id,
+               a.symbol, a.setup, a.direction, a.entry, a.stop_loss,
+               a.target1, a.target2,
+               o.status, o.exit_price, o.exit_time, o.pnl_pct, o.resolved_at
+        FROM alerts_log a
+        JOIN alert_outcomes o ON o.alert_id = a.id
+        WHERE a.category IN ({cat_ph})
+    """
+    params: list = list(categories)
+    if user_id is not None:
+        sql += " AND a.user_id = ?"
+        params.append(user_id)
+    sql += " ORDER BY o.resolved_at"
+    with _conn() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [dict(zip(_ALERT_OUTCOME_COLS, row)) for row in rows]

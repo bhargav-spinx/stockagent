@@ -297,16 +297,88 @@ def backtest_symbol(symbol: str, days: int = 90,
     return stats
 
 
+def backtest_symbol_score(symbol: str, days: int = 90,
+                          min_score: int = 90) -> BacktestStats:
+    """Walk-forward backtest of the intraday_score engine (#1).
+
+    At each in-window candle, score the history-so-far; the first candle of a
+    session whose score ≥ min_score with a direction opens a trade, resolved
+    with the same §7 partial-exit model used in production. One trade per
+    symbol per day (matches the live autoscan dedup). The market-index regime
+    gate is NOT applied here — index history isn't reconstructed per-candle —
+    so live results will be slightly stricter than this backtest."""
+    import intraday_score
+
+    sym = symbol.upper().strip()
+    if "." not in sym:
+        sym = f"{sym}.NS"
+
+    period_str = f"{days}d" if days <= 60 else f"{(days + 29) // 30}mo"
+    df = fetch_data(sym, period=period_str, interval="5m")
+    df = _normalize_ist(df)
+
+    stats = BacktestStats(
+        symbol=sym,
+        period_start=df.index[0] if len(df) else datetime.now(IST),
+        period_end=df.index[-1] if len(df) else datetime.now(IST),
+    )
+    if len(df) < MIN_WARMUP_CANDLES + 10:
+        logger.warning("%s: insufficient history (%d candles)", sym, len(df))
+        return stats
+
+    fired_days: set = set()      # session dates already traded
+    candles_in_window = 0
+    for i in range(MIN_WARMUP_CANDLES, len(df)):
+        slice_df = df.iloc[: i + 1]
+        ts = slice_df.index[-1].to_pydatetime()
+        if not is_intraday_entry_window(ts):
+            continue
+        candles_in_window += 1
+        if ts.date() in fired_days:
+            continue
+        try:
+            card = intraday_score.score_stock(slice_df, sym)
+        except Exception:
+            continue
+        if card.direction == "none" or card.score < min_score:
+            continue
+        alert = {
+            "symbol": sym, "entry": card.entry, "stop_loss": card.stop_loss,
+            "target1": card.target1, "target2": card.target2,
+            "direction": card.direction, "generated_at": ts,
+        }
+        outcome = eod_report.resolve_intraday(alert, df=df)
+        if outcome.get("status") in (None, "open", "no_data"):
+            continue  # last candle of data — no forward bars to resolve against
+        fired_days.add(ts.date())
+        stats.trades.append(Trade(
+            symbol=sym, setup=f"score{card.score}", direction=card.direction,
+            entry_time=ts, entry=card.entry, stop_loss=card.stop_loss,
+            target1=card.target1, target2=card.target2,
+            status=outcome.get("status", "open"),
+            exit_time=outcome.get("exit_time"),
+            exit_price=outcome.get("exit_price"),
+            pnl_gross_pct=outcome.get("pnl_pct") or 0.0,
+        ))
+    stats.candles_in_window = candles_in_window
+    return stats
+
+
 def backtest_many(symbols: Iterable[str], days: int = 90,
                  setup_filter: str | None = None,
                  atr_lo: float | None = None,
-                 atr_hi: float | None = None) -> list[BacktestStats]:
+                 atr_hi: float | None = None,
+                 score_mode: bool = False,
+                 min_score: int = 90) -> list[BacktestStats]:
     results = []
     for sym in symbols:
         try:
-            results.append(backtest_symbol(
-                sym, days, setup_filter, atr_lo=atr_lo, atr_hi=atr_hi
-            ))
+            if score_mode:
+                results.append(backtest_symbol_score(sym, days, min_score=min_score))
+            else:
+                results.append(backtest_symbol(
+                    sym, days, setup_filter, atr_lo=atr_lo, atr_hi=atr_hi
+                ))
         except Exception as e:
             logger.error("backtest %s failed: %s", sym, e)
     return results
@@ -404,6 +476,10 @@ def _cli():
                         help="Days of history (default: 90)")
     parser.add_argument("--setup", choices=["A", "B", "C"], default=None,
                         help="Restrict to one setup (default: all)")
+    parser.add_argument("--score", action="store_true",
+                        help="Backtest the intraday_score engine instead of setups A/B/C")
+    parser.add_argument("--min-score", type=int, default=90,
+                        help="Score gate for --score mode (default: 90)")
     parser.add_argument("--atr-lo", type=float, default=None,
                         help="Override ATR lower bound (default 0.004 = 0.4%%)")
     parser.add_argument("--atr-hi", type=float, default=None,
@@ -428,12 +504,14 @@ def _cli():
     if args.atr_lo is not None or args.atr_hi is not None:
         atr_note = (f"  ATR override: lo={args.atr_lo or 0.004:.4f} "
                     f"hi={args.atr_hi or 0.015:.4f}")
+    mode_note = f"score≥{args.min_score}" if args.score else f"setup={args.setup or 'all'}"
     print(f"Backtesting {len(symbols)} symbol(s) over {args.days} days "
-          f"(setup={args.setup or 'all'}){atr_note}\n")
+          f"({mode_note}){atr_note}\n")
 
     all_stats = backtest_many(
         symbols, days=args.days, setup_filter=args.setup,
         atr_lo=args.atr_lo, atr_hi=args.atr_hi,
+        score_mode=args.score, min_score=args.min_score,
     )
     for s in all_stats:
         print(format_stats(s))
