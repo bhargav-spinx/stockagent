@@ -1,0 +1,41 @@
+name: Deploy to VM
+
+# Auto-deploy on every push to main (and a manual button). SSHes into the GCP
+# VM, fast-forwards the code to this commit, and runs deploy/deploy.sh
+# (pip-install-if-changed -> restart stockbot -> health check).
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   VM_HOST      public IP / hostname of the VM
+#   VM_USER      SSH user (e.g. ladanibhargav)
+#   VM_SSH_KEY   private SSH key whose public half is in the VM's authorized_keys
+#   VM_SSH_PORT  (optional) SSH port, defaults to 22
+# See deploy/README.md for the one-time VM setup.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Never run two deploys at once; if a newer push arrives, cancel the in-flight one.
+concurrency:
+  group: vm-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: ${{ secrets.VM_SSH_PORT || 22 }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd ~/stockagent
+            git fetch origin main
+            git reset --hard origin/main
+            bash deploy/deploy.sh
