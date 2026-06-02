@@ -21,9 +21,10 @@ Direction (long / short) is inferred from the alignment of gap, VWAP, EMA and
 the ORB breakout. The same machinery scores both sides; bullish vs bearish
 probability is derived from the directional score.
 
-NOT scored (context only, shown in the card): Supertrend, market-index trend,
-and 52-week proximity. Two spec inputs have no data source and are stubbed:
-delivery % and news/earnings (see _delivery_pct / _news_trigger).
+NOT scored (context/risk only, shown in the card): Supertrend, market-index
+trend (regime_ok gate), 52-week proximity, delivery % and earnings proximity
+(event_ok gate) — the last two via market_context (NSE, cached daily). Live
+news (Marketaux) enriches only fired alerts in the bot layer, not this scorer.
 """
 from __future__ import annotations
 
