@@ -59,8 +59,8 @@ class ScoreCard:
     stop_loss: float | None
     target1: float | None
     target2: float | None
-    bullish_prob: int
-    bearish_prob: int
+    bull_conviction: int   # heuristic 50–90 lean from the score — NOT an empirical probability
+    bear_conviction: int
     gap_pct: float | None
     rvol: float | None
     orb_window: int | None         # which window (15/30) was used
@@ -144,9 +144,13 @@ def _orb_breakout(today_df: pd.DataFrame, price: float):
     return best
 
 
-def _dir_prob(score: int) -> int:
-    """Map score → probability in the trade direction (heuristic, monotonic).
-    Calibrated so 88 → ~82, matching the spec's example."""
+def _dir_conviction(score: int) -> int:
+    """Map score → a 50–90 'conviction' lean in the trade direction.
+
+    This is a monotonic relabel of the score for display only. It is NOT a
+    probability and is NOT calibrated against realized outcomes — do not present
+    it as a win likelihood. The honest measure of how often a score bucket wins
+    is the realized win rate in stats.py (available once trades have resolved)."""
     return int(round(min(90, max(50, 45 + score * 0.42))))
 
 
@@ -201,7 +205,7 @@ def score_stock(df: pd.DataFrame, symbol: str,
             symbol=symbol, price=price, direction="none", score=0,
             rating="Avoid", breakdown={}, signals={},
             entry=None, stop_loss=None, target1=None, target2=None,
-            bullish_prob=50, bearish_prob=50, gap_pct=None, rvol=None,
+            bull_conviction=50, bear_conviction=50, gap_pct=None, rvol=None,
             orb_window=None, notes=[reason],
         )
 
@@ -312,7 +316,7 @@ def score_stock(df: pd.DataFrame, symbol: str,
     entry = price
     sl, t1, t2 = trade_levels(entry, direction, df)
 
-    dp = _dir_prob(score)
+    dp = _dir_conviction(score)
     bullish = dp if long else 100 - dp
     bearish = 100 - bullish
 
@@ -372,7 +376,7 @@ def score_stock(df: pd.DataFrame, symbol: str,
         symbol=symbol, price=price, direction=direction, score=score,
         rating=rating, breakdown=breakdown, signals=signals,
         entry=entry, stop_loss=sl, target1=t1, target2=t2,
-        bullish_prob=bullish, bearish_prob=bearish,
+        bull_conviction=bullish, bear_conviction=bearish,
         gap_pct=gap, rvol=rvol, orb_window=orb_win,
         regime_ok=regime_ok, event_ok=event_ok, delivery_pct=deliv,
         context=context, notes=notes,
@@ -411,8 +415,9 @@ def format_scorecard(c: ScoreCard) -> str:
         f"🥇 Target 1: ₹{c.target1:,.2f}",
         f"🥈 Target 2: ₹{c.target2:,.2f}",
         "",
-        f"Bullish Probability: {c.bullish_prob}%",
-        f"Bearish Probability: {c.bearish_prob}%",
+        f"Directional lean: {'Long' if c.direction == 'long' else 'Short'} "
+        f"({max(c.bull_conviction, c.bear_conviction)}/100 conviction)",
+        "_Conviction is a heuristic from the score, not a win probability._",
     ]
     if c.context:
         lines += ["", "_" + "  ·  ".join(c.context) + "_"]

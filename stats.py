@@ -16,7 +16,14 @@ from typing import Any
 
 import subscriptions
 import eod_report
+import riskmetrics
 from eod_report import COST_PER_TRADE_PCT, _classify, _hold_days
+
+
+def _net_returns(rows: list[dict[str, Any]]) -> list[float]:
+    """Per-trade NET % returns from resolved rows (gross pnl minus costs)."""
+    return [r["pnl_pct"] - COST_PER_TRADE_PCT
+            for r in rows if r.get("pnl_pct") is not None]
 
 ALL_CATEGORIES = tuple(eod_report.INTRADAY_CATEGORIES | eod_report.SWING_CATEGORIES)
 
@@ -89,13 +96,17 @@ def build_stats_report() -> str:
         "decisive (W+L) trades only._\n",
         "*Overall*",
         _line("All", _agg(rows)),
+        riskmetrics.format_line(_net_returns(rows), "Risk-adj"),
+        "_Win rate/P&L alone can't separate skill from luck — if the 95% CI "
+        "straddles 0, there is no demonstrable edge yet._",
         "",
         "*By type*",
         _line("🟦 Intraday auto", _agg(scan_rows)),
         _line("🟧 Manual intraday", _agg(by_cat.get("manual_intraday", []))),
         _line("🟪 Swing auto", _agg(by_cat.get("swing_auto", []))),
         _line("📅 Manual swing", _agg(by_cat.get("manual_swing", []))),
-        _line("📡 Channel tips", _agg(by_cat.get("channel_tip", []))),
+        _line("📡 Channel tips (our analysis)", _agg(by_cat.get("channel_tip", []))),
+        _line("📞 Channel CALLS (their levels)", _agg(by_cat.get("channel_call", []))),
     ]
 
     # Intraday by score bucket — is the gate set right?
@@ -107,12 +118,13 @@ def build_stats_report() -> str:
             if bucket:
                 parts.append(_line(f"score {label}", _agg(bucket)))
 
-    # Channel tips by channel — which sources actually work.
-    tip_rows = by_cat.get("channel_tip", [])
-    if tip_rows:
-        channels = sorted({(r.get("setup") or "?") for r in tip_rows})
-        parts += ["", "*Channel tips by source*"]
+    # Channel CALLS by source (the channel's OWN levels) — which sources
+    # actually work, judged on what they posted, not on our re-derived signal.
+    call_rows = by_cat.get("channel_call", [])
+    if call_rows:
+        channels = sorted({(r.get("setup") or "?") for r in call_rows})
+        parts += ["", "*Channel CALLS by source* (their own entry/target/SL)"]
         for ch in channels:
-            parts.append(_line(ch, _agg([r for r in tip_rows if r.get("setup") == ch])))
+            parts.append(_line(ch, _agg([r for r in call_rows if r.get("setup") == ch])))
 
     return "\n".join(parts)

@@ -12,6 +12,19 @@ Sources (current as of mid-2026):
 - NIFTY Bank:      nsearchives.nseindia.com/content/indices/ind_niftybanklist.csv
 """
 
+import json
+import logging
+from datetime import date
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Dated point-in-time membership snapshots live here as `<YYYY-MM-DD>.json`
+# (a JSON list of bare symbols). Backtests should use the snapshot whose date is
+# on/before the test date so the universe reflects what was actually tradable
+# THEN — including names later delisted/ejected. See point_in_time_universe().
+SNAPSHOT_DIR = Path(__file__).parent / "universe_snapshots"
+
 # ---------- NIFTY 50 ----------
 NIFTY_50 = [
     "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
@@ -129,3 +142,59 @@ TIER1_WATCHLIST = [
     "KOTAKBANK", "INFY", "TCS", "LT", "BAJFINANCE",
     "MARUTI", "TATAMOTORS", "ITC", "HINDUNILVR",
 ]
+
+
+# ---------- Point-in-time membership (survivorship control) ----------
+
+def has_point_in_time_data() -> bool:
+    """True if any dated membership snapshot exists."""
+    return SNAPSHOT_DIR.exists() and any(SNAPSHOT_DIR.glob("*.json"))
+
+
+def save_universe_snapshot(symbols: list[str],
+                           as_of: date | None = None) -> Path:
+    """Persist today's universe as a dated snapshot so that, going forward,
+    backtests can reconstruct point-in-time membership. (Historical membership
+    before the first snapshot must be sourced manually from NSE archives — it
+    cannot be recovered from a current list.)"""
+    as_of = as_of or date.today()
+    SNAPSHOT_DIR.mkdir(exist_ok=True)
+    path = SNAPSHOT_DIR / f"{as_of.isoformat()}.json"
+    path.write_text(json.dumps(sorted(set(symbols)), indent=0), encoding="utf-8")
+    logger.info("universe snapshot saved: %s (%d symbols)", path, len(set(symbols)))
+    return path
+
+
+def point_in_time_universe(as_of: date) -> list[str] | None:
+    """Membership as of `as_of`, from the latest snapshot dated on/before it.
+
+    Returns None when no usable snapshot exists — callers MUST treat a None as
+    'survivorship bias present' and say so, rather than silently using today's
+    list. This function never fabricates historical membership."""
+    if not SNAPSHOT_DIR.exists():
+        return None
+    candidates = []
+    for p in SNAPSHOT_DIR.glob("*.json"):
+        try:
+            d = date.fromisoformat(p.stem)
+        except ValueError:
+            continue
+        if d <= as_of:
+            candidates.append((d, p))
+    if not candidates:
+        return None
+    _, latest = max(candidates, key=lambda x: x[0])
+    try:
+        return json.loads(latest.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("point_in_time_universe: failed to read %s: %s", latest, e)
+        return None
+
+
+SURVIVORSHIP_NOTE = (
+    "⚠️ SURVIVORSHIP BIAS: the symbol universe is TODAY's membership "
+    "(universe.py). Stocks delisted/ejected during the test window are absent, "
+    "so results are optimistic. To remove this bias, accumulate dated snapshots "
+    "via universe.save_universe_snapshot() and pass point-in-time membership to "
+    "the backtest. No snapshots are present, so this run IS biased."
+)

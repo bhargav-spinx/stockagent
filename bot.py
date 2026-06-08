@@ -47,6 +47,7 @@ from scanner import (
 )
 import intraday_score
 from scanner_filters import is_intraday_entry_window
+import universe
 from universe import INTRADAY_UNIVERSE, SWING_UNIVERSE
 import subscriptions
 import eod_report
@@ -1414,6 +1415,19 @@ async def _eod_report_tick(app: Application) -> None:
     key = _eod_run_key()
     if subscriptions.already_fired(key):
         return  # already ran today
+
+    # Once-daily point-in-time membership snapshot (survivorship control, HIGH-3).
+    # Records today's tradable universe so future backtests can reconstruct
+    # what was actually in the universe THEN. Best-effort — never blocks the EOD
+    # report. Runs before the no-subscriber early return so it always fires.
+    try:
+        snap = await asyncio.to_thread(
+            universe.save_universe_snapshot,
+            list(set(INTRADAY_UNIVERSE) | set(SWING_UNIVERSE)),
+        )
+        logger.info("EOD: universe snapshot written → %s", snap)
+    except Exception as e:
+        logger.warning("EOD: universe snapshot failed: %s", e)
 
     subs = subscriptions.get_eod_subscribers()
     if not subs:

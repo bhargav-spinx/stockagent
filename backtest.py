@@ -30,8 +30,10 @@ import ssl_dev  # noqa: E402
 ssl_dev.install_if_enabled()
 
 from data_provider import fetch_data  # noqa: E402
+import riskmetrics  # noqa: E402
 from scanner_filters import apply_universal_filters, is_intraday_entry_window  # noqa: E402
 from scanner_setups import detect_setup_a, detect_setup_b, detect_setup_c, Signal  # noqa: E402
+import universe  # noqa: E402
 from universe import TIER1_WATCHLIST  # noqa: E402
 import eod_report  # noqa: E402
 from eod_report import COST_PER_TRADE_PCT  # noqa: E402
@@ -105,6 +107,12 @@ class BacktestStats:
     @property
     def net_pnl_total(self) -> float:
         return self.net_pnl_avg * self.n
+
+    @property
+    def net_returns(self) -> list[float]:
+        """Per-trade NET % returns (gross minus round-trip costs) — the series
+        risk metrics operate on."""
+        return [t.pnl_gross_pct - COST_PER_TRADE_PCT for t in self.trades]
 
     @property
     def avg_win(self) -> float:
@@ -184,37 +192,48 @@ def _resolve_outcome(sig: Signal, sig_time: datetime, df: pd.DataFrame) -> dict:
     return eod_report.resolve_intraday(alert, df=df)
 
 
-def backtest_symbol(symbol: str, days: int = 90,
-                   setup_filter: str | None = None,
-                   atr_lo: float | None = None,
-                   atr_hi: float | None = None) -> BacktestStats:
-    """
-    Run backtest on one symbol over the last `days` calendar days.
+def _period_str(days: int) -> str:
+    return f"{days}d" if days <= 60 else f"{(days + 29) // 30}mo"
 
-    setup_filter='A' to test only Setup A. None = all available setups.
-    atr_lo / atr_hi to override the universal ATR-bounds filter (defaults
-    are 0.004 / 0.015 from STRATEGY.md §5).
-    """
+
+def _fetch_5m(symbol: str, days: int) -> tuple[str, pd.DataFrame]:
+    """Normalize symbol, fetch 5m history, IST-localize. Returns (sym, df)."""
     sym = symbol.upper().strip()
     if "." not in sym:
         sym = f"{sym}.NS"
-
-    period_str = f"{days}d" if days <= 60 else f"{(days + 29) // 30}mo"
-    df = fetch_data(sym, period=period_str, interval="5m")
+    df = fetch_data(sym, period=_period_str(days), interval="5m")
     df = _normalize_ist(df)
+    # MEDIUM-7: requested vs actual coverage. Intraday history is provider-
+    # capped (yfinance ~60d of 5m), so "--days 90" can silently cover far less.
+    if len(df):
+        span = (df.index[-1].date() - df.index[0].date()).days + 1
+        if span < days * 0.6:
+            logger.warning(
+                "%s: requested %dd of 5m history but only ~%dd returned "
+                "(provider cap — your backtest window is shorter than asked).",
+                sym, days, span)
+    return sym, df
 
-    if len(df) < MIN_WARMUP_CANDLES + 10:
-        logger.warning("%s: insufficient history (%d candles)", sym, len(df))
-        return BacktestStats(sym, df.index[0] if len(df) else datetime.now(IST),
-                            df.index[-1] if len(df) else datetime.now(IST))
 
+def _simulate_setups(df: pd.DataFrame, sym: str,
+                     setup_filter: str | None = None,
+                     atr_lo: float | None = None,
+                     atr_hi: float | None = None,
+                     entry_dates: set | None = None,
+                     ) -> tuple[list[Trade], int, dict[str, int]]:
+    """Pure in-memory candle walk for setups A/B/C over a pre-fetched df.
+
+    `entry_dates` (a set of dates) restricts which sessions may OPEN trades —
+    indicator context and outcome resolution still use the full df, so a fold's
+    test window gets historical context without being able to peek forward.
+    Returns (trades, candles_in_window, filter_rejections)."""
     detectors = [detect_setup_a, detect_setup_b, detect_setup_c]
     if setup_filter:
         detectors = [d for d in detectors
-                    if d.__name__ == f"detect_setup_{setup_filter.lower()}"]
+                     if d.__name__ == f"detect_setup_{setup_filter.lower()}"]
 
-    stats = BacktestStats(symbol=sym, period_start=df.index[0], period_end=df.index[-1])
-    fired_today: set[tuple[str, str]] = set()  # (symbol, setup) — no re-entry same day
+    trades: list[Trade] = []
+    fired_today: set[tuple[str, str]] = set()
     last_session_date = None
     filter_rejections: dict[str, int] = {}
     candles_in_window = 0
@@ -223,7 +242,6 @@ def backtest_symbol(symbol: str, days: int = 90,
         slice_df = df.iloc[: i + 1]
         ts = slice_df.index[-1].to_pydatetime()
 
-        # Reset same-day re-entry tracking on new session
         cur_date = ts.date()
         if cur_date != last_session_date:
             fired_today.clear()
@@ -231,11 +249,10 @@ def backtest_symbol(symbol: str, days: int = 90,
 
         if not is_intraday_entry_window(ts):
             continue
+        if entry_dates is not None and cur_date not in entry_dates:
+            continue
         candles_in_window += 1
 
-        # Universal filters first (skip time-window check; we pre-filtered above).
-        # When custom ATR bounds are passed, swap the default filter for one
-        # using the override values.
         if atr_lo is not None or atr_hi is not None:
             f = _filters_with_atr_override(
                 slice_df, direction="long",
@@ -245,7 +262,6 @@ def backtest_symbol(symbol: str, days: int = 90,
         else:
             f = apply_universal_filters(slice_df, direction="long", check_time=False)
         if not f.passed:
-            # Coarse-bucket the rejection reason
             bucket = f.reason.split("(")[0].split("<")[0].split(">")[0].strip()[:40]
             filter_rejections[bucket] = filter_rejections.get(bucket, 0) + 1
             continue
@@ -254,7 +270,6 @@ def backtest_symbol(symbol: str, days: int = 90,
             sig = detector(slice_df, sym)
             if sig is None:
                 continue
-            # Re-check filters with direction-specific gates
             if atr_lo is not None or atr_hi is not None:
                 f2 = _filters_with_atr_override(
                     slice_df, direction=sig.direction,
@@ -265,80 +280,49 @@ def backtest_symbol(symbol: str, days: int = 90,
                 f2 = apply_universal_filters(slice_df, direction=sig.direction, check_time=False)
             if not f2.passed:
                 continue
-            # Same-day re-entry guard
             key = (sig.symbol, sig.setup)
             if key in fired_today:
                 continue
             fired_today.add(key)
 
-            # Resolve outcome using forward bars (rest of df after ts)
             outcome = _resolve_outcome(sig, ts, df)
             if outcome.get("status") == "no_data":
                 continue
-            trade = Trade(
-                symbol=sig.symbol,
-                setup=sig.setup,
-                direction=sig.direction,
-                entry_time=ts,
-                entry=sig.entry,
-                stop_loss=sig.stop_loss,
-                target1=sig.target1,
-                target2=sig.target2,
+            trades.append(Trade(
+                symbol=sig.symbol, setup=sig.setup, direction=sig.direction,
+                entry_time=ts, entry=sig.entry, stop_loss=sig.stop_loss,
+                target1=sig.target1, target2=sig.target2,
                 status=outcome.get("status", "open"),
                 exit_time=outcome.get("exit_time"),
                 exit_price=outcome.get("exit_price"),
                 pnl_gross_pct=outcome.get("pnl_pct") or 0.0,
-            )
-            stats.trades.append(trade)
-            break  # one trade per candle; move to next candle
+            ))
+            break  # one trade per candle
 
-    stats.candles_in_window = candles_in_window
-    stats.filter_rejections = filter_rejections
-    return stats
+    return trades, candles_in_window, filter_rejections
 
 
-def backtest_symbol_score(symbol: str, days: int = 90,
-                          min_score: int = 90) -> BacktestStats:
-    """Walk-forward backtest of the intraday_score engine (#1).
-
-    At each in-window candle, score the history-so-far; the first candle of a
-    session whose score ≥ min_score with a direction opens a trade, resolved
-    with the same §7 partial-exit model used in production. One trade per
-    symbol per day (matches the live autoscan dedup). The market-index regime
-    gate is NOT applied here — index history isn't reconstructed per-candle —
-    so live results will be slightly stricter than this backtest."""
+def _simulate_score(df: pd.DataFrame, sym: str, min_score: int = 90,
+                    entry_dates: set | None = None) -> tuple[list[Trade], int]:
+    """Pure in-memory candle walk for the intraday_score engine over a
+    pre-fetched df. `entry_dates` restricts which sessions may open trades."""
     import intraday_score
 
-    sym = symbol.upper().strip()
-    if "." not in sym:
-        sym = f"{sym}.NS"
-
-    period_str = f"{days}d" if days <= 60 else f"{(days + 29) // 30}mo"
-    df = fetch_data(sym, period=period_str, interval="5m")
-    df = _normalize_ist(df)
-
-    stats = BacktestStats(
-        symbol=sym,
-        period_start=df.index[0] if len(df) else datetime.now(IST),
-        period_end=df.index[-1] if len(df) else datetime.now(IST),
-    )
-    if len(df) < MIN_WARMUP_CANDLES + 10:
-        logger.warning("%s: insufficient history (%d candles)", sym, len(df))
-        return stats
-
-    fired_days: set = set()      # session dates already traded
+    trades: list[Trade] = []
+    fired_days: set = set()
     candles_in_window = 0
     for i in range(MIN_WARMUP_CANDLES, len(df)):
         slice_df = df.iloc[: i + 1]
         ts = slice_df.index[-1].to_pydatetime()
         if not is_intraday_entry_window(ts):
             continue
+        d = ts.date()
+        if entry_dates is not None and d not in entry_dates:
+            continue
         candles_in_window += 1
-        if ts.date() in fired_days:
+        if d in fired_days:
             continue
         try:
-            # skip_external: no live NSE delivery/earnings calls — keep the
-            # backtest hermetic (and those inputs are today's, not historical).
             card = intraday_score.score_stock(slice_df, sym, skip_external=True)
         except Exception:
             continue
@@ -351,9 +335,9 @@ def backtest_symbol_score(symbol: str, days: int = 90,
         }
         outcome = eod_report.resolve_intraday(alert, df=df)
         if outcome.get("status") in (None, "open", "no_data"):
-            continue  # last candle of data — no forward bars to resolve against
-        fired_days.add(ts.date())
-        stats.trades.append(Trade(
+            continue
+        fired_days.add(d)
+        trades.append(Trade(
             symbol=sym, setup=f"score{card.score}", direction=card.direction,
             entry_time=ts, entry=card.entry, stop_loss=card.stop_loss,
             target1=card.target1, target2=card.target2,
@@ -362,7 +346,52 @@ def backtest_symbol_score(symbol: str, days: int = 90,
             exit_price=outcome.get("exit_price"),
             pnl_gross_pct=outcome.get("pnl_pct") or 0.0,
         ))
-    stats.candles_in_window = candles_in_window
+    return trades, candles_in_window
+
+
+def backtest_symbol(symbol: str, days: int = 90,
+                   setup_filter: str | None = None,
+                   atr_lo: float | None = None,
+                   atr_hi: float | None = None) -> BacktestStats:
+    """In-sample backtest on one symbol over the last `days` calendar days.
+
+    NOTE: this fits and reports on the SAME window — use it for exploration, not
+    as evidence of edge. For an honest out-of-sample read use walk_forward().
+    setup_filter='A' restricts to Setup A; atr_lo/atr_hi override the §5 ATR band.
+    """
+    sym, df = _fetch_5m(symbol, days)
+    if len(df) < MIN_WARMUP_CANDLES + 10:
+        logger.warning("%s: insufficient history (%d candles)", sym, len(df))
+        return BacktestStats(sym, df.index[0] if len(df) else datetime.now(IST),
+                            df.index[-1] if len(df) else datetime.now(IST))
+
+    trades, ciw, rej = _simulate_setups(df, sym, setup_filter, atr_lo, atr_hi)
+    stats = BacktestStats(symbol=sym, period_start=df.index[0], period_end=df.index[-1])
+    stats.trades = trades
+    stats.candles_in_window = ciw
+    stats.filter_rejections = rej
+    return stats
+
+
+def backtest_symbol_score(symbol: str, days: int = 90,
+                          min_score: int = 90) -> BacktestStats:
+    """In-sample backtest of the intraday_score engine (#1) on one symbol.
+
+    One trade per symbol per day (matches the live autoscan dedup). The
+    market-index regime gate is NOT applied here, so live results will be
+    slightly stricter. In-sample — see walk_forward() for an OOS read."""
+    sym, df = _fetch_5m(symbol, days)
+    stats = BacktestStats(
+        symbol=sym,
+        period_start=df.index[0] if len(df) else datetime.now(IST),
+        period_end=df.index[-1] if len(df) else datetime.now(IST),
+    )
+    if len(df) < MIN_WARMUP_CANDLES + 10:
+        logger.warning("%s: insufficient history (%d candles)", sym, len(df))
+        return stats
+    trades, ciw = _simulate_score(df, sym, min_score=min_score)
+    stats.trades = trades
+    stats.candles_in_window = ciw
     return stats
 
 
@@ -384,6 +413,177 @@ def backtest_many(symbols: Iterable[str], days: int = 90,
         except Exception as e:
             logger.error("backtest %s failed: %s", sym, e)
     return results
+
+
+# ---------- walk-forward (out-of-sample) ----------
+
+def _chunks(seq: list, n: int) -> list[list]:
+    """Split a list into n contiguous near-equal chunks."""
+    n = max(1, min(n, len(seq)))
+    size = len(seq) / n
+    return [seq[round(i * size):round((i + 1) * size)] for i in range(n)]
+
+
+def _slice_with_context(df: pd.DataFrame, dates: set, context_days: int) -> pd.DataFrame:
+    """All candles from (min(dates) − context_days) through max(dates).
+    Gives the entry window indicator/prior-session context WITHOUT any forward
+    leakage (nothing after max(dates) is included)."""
+    lo, hi = min(dates), max(dates)
+    start = lo - timedelta(days=context_days)
+    d = df.index.date
+    mask = (d >= start) & (d <= hi)
+    return df[mask]
+
+
+def _sim_param(df: pd.DataFrame, sym: str, param, score_mode: bool,
+               entry_dates: set) -> list[Trade]:
+    if score_mode:
+        trades, _ = _simulate_score(df, sym, min_score=param, entry_dates=entry_dates)
+    else:
+        lo, hi = param
+        trades, _, _ = _simulate_setups(df, sym, atr_lo=lo, atr_hi=hi,
+                                        entry_dates=entry_dates)
+    return trades
+
+
+def _mean_net(trades: list[Trade]) -> float:
+    if not trades:
+        return float("-inf")          # a param that never trades can't be "best"
+    return sum(t.pnl_gross_pct - COST_PER_TRADE_PCT for t in trades) / len(trades)
+
+
+# Default parameter grids searched per training window.
+_SCORE_GRID = [80, 85, 90, 95]
+_ATR_GRID = [(0.004, 0.015), (0.003, 0.020), (0.005, 0.012), (0.004, 0.025)]
+
+
+def walk_forward(symbols: Iterable[str], days: int = 120,
+                 score_mode: bool = False, n_folds: int = 4,
+                 train_folds: int = 2, context_days: int = 10,
+                 grid: list | None = None) -> dict | None:
+    """Anchored walk-forward optimization — the only mode here that yields an
+    OUT-OF-SAMPLE read.
+
+    Splits the calendar into `n_folds` contiguous folds. For each test fold, the
+    parameter (score gate, or ATR band) is optimized on the preceding
+    `train_folds` folds, then applied UNSEEN to the test fold. Only test-fold
+    trades are reported. Entries fire only on in-window sessions; indicator
+    context comes from `context_days` of prior history with no forward peeking.
+
+    Returns a dict with oos_trades, per-fold log, and the number of parameter
+    evaluations (for multiple-testing context), or None if data is insufficient.
+    """
+    grid = grid or (_SCORE_GRID if score_mode else _ATR_GRID)
+
+    # Fetch each symbol once; walk-forward is then fully in-memory.
+    dfs: dict[str, pd.DataFrame] = {}
+    for s in symbols:
+        try:
+            sym, df = _fetch_5m(s, days)
+            if len(df) >= MIN_WARMUP_CANDLES + 10:
+                dfs[sym] = df
+        except Exception as e:
+            logger.error("walk_forward fetch %s failed: %s", s, e)
+    if not dfs:
+        return None
+
+    all_dates = sorted({d for df in dfs.values() for d in set(df.index.date)})
+    folds = _chunks(all_dates, n_folds)
+    if len(folds) <= train_folds:
+        logger.warning("walk_forward: not enough sessions (%d) for %d folds",
+                       len(all_dates), n_folds)
+        return None
+
+    oos: list[Trade] = []
+    optimizations = 0
+    fold_log: list[dict] = []
+
+    for f in range(train_folds, len(folds)):
+        train_dates = {d for c in folds[f - train_folds:f] for d in c}
+        test_dates = set(folds[f])
+        if not train_dates or not test_dates:
+            continue
+
+        best_param, best_metric = None, float("-inf")
+        for param in grid:
+            optimizations += 1
+            tr: list[Trade] = []
+            for sym, df in dfs.items():
+                sub = _slice_with_context(df, train_dates, context_days)
+                tr += _sim_param(sub, sym, param, score_mode, train_dates)
+            m = _mean_net(tr)
+            if m > best_metric:
+                best_metric, best_param = m, param
+
+        if best_param is None:
+            fold_log.append({"fold": f, "param": None, "train_metric": None,
+                             "test_trades": 0, "test_net": 0.0})
+            continue
+
+        test_tr: list[Trade] = []
+        for sym, df in dfs.items():
+            sub = _slice_with_context(df, test_dates, context_days)
+            test_tr += _sim_param(sub, sym, best_param, score_mode, test_dates)
+        oos += test_tr
+        fold_log.append({
+            "fold": f, "param": best_param,
+            "train_metric": best_metric,
+            "test_trades": len(test_tr),
+            "test_net": sum(t.pnl_gross_pct - COST_PER_TRADE_PCT for t in test_tr),
+        })
+
+    return {
+        "oos_trades": oos, "folds": fold_log, "optimizations": optimizations,
+        "n_symbols": len(dfs), "grid_size": len(grid),
+        "period_start": all_dates[0], "period_end": all_dates[-1],
+    }
+
+
+def format_walkforward(res: dict | None, score_mode: bool) -> str:
+    if not res or not res["folds"]:
+        return ("\n=== WALK-FORWARD: insufficient data for an out-of-sample "
+                "run (need several folds of intraday history) ===\n")
+
+    oos = res["oos_trades"]
+    returns = [t.pnl_gross_pct - COST_PER_TRADE_PCT for t in oos]
+    n = len(oos)
+    wins = sum(1 for t in oos if t.pnl_gross_pct > 0)
+    net = sum(returns)
+    param_label = "min_score" if score_mode else "ATR band"
+
+    lines = [
+        "\n" + "=" * 64,
+        f"WALK-FORWARD (OUT-OF-SAMPLE)  ·  {res['n_symbols']} symbols  ·  "
+        f"{res['period_start']} → {res['period_end']}",
+        "=" * 64,
+        f"Optimised {param_label} on each training window, then applied UNSEEN "
+        f"to the next fold.",
+        f"Parameter evaluations: {res['optimizations']} "
+        f"(grid {res['grid_size']} × {len(res['folds'])} folds) — treat any "
+        f"single 'good' result with multiple-testing skepticism.",
+        "",
+        "Per test fold:",
+        f"{'Fold':<5} {'Param':<14} {'TestTrades':>10} {'TestNet%':>10}",
+    ]
+    for fl in res["folds"]:
+        p = fl["param"]
+        p_str = (str(p) if p is not None else "—")[:14]
+        lines.append(f"{fl['fold']:<5} {p_str:<14} {fl['test_trades']:>10} "
+                     f"{fl['test_net']:>+10.2f}")
+
+    lines += [
+        "",
+        f"OOS trades:       {n}",
+        f"OOS hit rate:     {(wins / n * 100):.1f}%" if n else "OOS hit rate:     n/a",
+        f"OOS total net:    {net:+.2f}%",
+        f"OOS avg/trade:    {(net / n):+.3f}%" if n else "OOS avg/trade:    n/a",
+        riskmetrics.format_line(returns, "OOS risk-adj"),
+        "",
+        "_This is the honest number. If the OOS 95% CI straddles 0, the "
+        "strategy has no demonstrable edge on unseen data — regardless of how "
+        "good the in-sample backtest looked._",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 # ---------- reporting ----------
@@ -419,6 +619,7 @@ def format_stats(stats: BacktestStats) -> str:
         f"Avg loss:         {stats.avg_loss:+.2f}%",
         f"Expectancy:       {stats.expectancy:+.3f}% per trade",
         f"Max drawdown:     {stats.max_drawdown:.2f}%",
+        f"{riskmetrics.format_line(stats.net_returns, 'Risk-adj')}",
         f"",
         f"Outcome breakdown:",
     ]
@@ -430,6 +631,28 @@ def format_stats(stats: BacktestStats) -> str:
     return "\n".join(lines) + "\n"
 
 
+def benchmark_return(period_start: datetime, period_end: datetime,
+                     alias: str = "NIFTY") -> float | None:
+    """Buy-and-hold % return of the index over [period_start, period_end].
+    Best-effort: returns None if data can't be fetched. Used to answer the
+    only question that matters — did the strategy beat simply holding the index
+    over the same window?"""
+    try:
+        df = fetch_data(alias, period="1y", interval="1d")
+        df = _normalize_ist(df)
+        window = df[(df.index >= period_start) & (df.index <= period_end)]
+        if len(window) < 2:
+            return None
+        first = float(window["Close"].iloc[0])
+        last = float(window["Close"].iloc[-1])
+        if first == 0:
+            return None
+        return (last - first) / first * 100
+    except Exception as e:
+        logger.warning("benchmark fetch failed: %s", e)
+        return None
+
+
 def format_summary(all_stats: list[BacktestStats]) -> str:
     """Aggregate summary across all backtested symbols."""
     total_trades = sum(s.n for s in all_stats)
@@ -439,6 +662,16 @@ def format_summary(all_stats: list[BacktestStats]) -> str:
     total_wins = sum(s.wins for s in all_stats)
     total_gross = sum(s.gross_pnl_total for s in all_stats)
     total_net = sum(s.net_pnl_total for s in all_stats)
+    all_returns = [r for s in all_stats for r in s.net_returns]
+
+    # Benchmark: NIFTY buy-and-hold over the full backtest window.
+    starts = [s.period_start for s in all_stats if s.n]
+    ends = [s.period_end for s in all_stats if s.n]
+    bench = benchmark_return(min(starts), max(ends)) if starts else None
+    bench_line = (f"NIFTY buy&hold:   {bench:+.2f}% over same window "
+                  f"(strategy total net {total_net:+.2f}%)"
+                  if bench is not None else
+                  "NIFTY buy&hold:   n/a (benchmark fetch failed)")
 
     lines = [
         "\n" + "=" * 60,
@@ -449,6 +682,11 @@ def format_summary(all_stats: list[BacktestStats]) -> str:
         f"Total gross P&L:  {total_gross:+.2f}%",
         f"Total net P&L:    {total_net:+.2f}%  (after {COST_PER_TRADE_PCT}%/trade costs)",
         f"Avg net per trade: {(total_net / total_trades):+.3f}%",
+        riskmetrics.format_line(all_returns, "Risk-adj"),
+        bench_line,
+        "_Benchmark caveat: this is an in-sample, survivorship-biased universe "
+        "(see universe.py / backtest --walkforward). Beating it here is NOT "
+        "evidence of a live edge._",
         "",
         "Per-symbol summary:",
         f"{'Symbol':<14} {'Trades':>7} {'HitRate':>9} {'Net P&L':>10} {'Expect':>9}",
@@ -482,6 +720,14 @@ def _cli():
                         help="Backtest the intraday_score engine instead of setups A/B/C")
     parser.add_argument("--min-score", type=int, default=90,
                         help="Score gate for --score mode (default: 90)")
+    parser.add_argument("--walkforward", action="store_true",
+                        help="Out-of-sample walk-forward optimisation — the only "
+                             "honest evaluation. Optimises params per training "
+                             "window, reports unseen test folds only.")
+    parser.add_argument("--folds", type=int, default=4,
+                        help="Walk-forward folds (default: 4)")
+    parser.add_argument("--train-folds", type=int, default=2,
+                        help="Training folds preceding each test fold (default: 2)")
     parser.add_argument("--atr-lo", type=float, default=None,
                         help="Override ATR lower bound (default 0.004 = 0.4%%)")
     parser.add_argument("--atr-hi", type=float, default=None,
@@ -507,6 +753,18 @@ def _cli():
         atr_note = (f"  ATR override: lo={args.atr_lo or 0.004:.4f} "
                     f"hi={args.atr_hi or 0.015:.4f}")
     mode_note = f"score≥{args.min_score}" if args.score else f"setup={args.setup or 'all'}"
+
+    if not universe.has_point_in_time_data():
+        print(universe.SURVIVORSHIP_NOTE + "\n")
+
+    if args.walkforward:
+        print(f"Walk-forward (OOS) on {len(symbols)} symbol(s) over {args.days} "
+              f"days, {args.folds} folds ({'score' if args.score else 'setups'})\n")
+        res = walk_forward(symbols, days=args.days, score_mode=args.score,
+                           n_folds=args.folds, train_folds=args.train_folds)
+        print(format_walkforward(res, args.score))
+        return
+
     print(f"Backtesting {len(symbols)} symbol(s) over {args.days} days "
           f"({mode_note}){atr_note}\n")
 

@@ -65,7 +65,30 @@ Final call = majority vote with confidence = % of indicators agreeing. Need at l
 - **Scheduled alerts** — use `app.job_queue.run_repeating()` to check watchlists hourly
 - **Add fundamentals** — pull P/E, ROE from `yf.Ticker.info` and weight them
 - **Better intelligence** — feed the indicator output to Claude/GPT API for natural-language explanations
-- **Backtesting** — run the signal logic over historical data to measure accuracy before trusting it
+- **Backtesting** — replay the signal logic over historical data to *characterise* past behaviour (hit rate, P&L distribution, drawdown). Past behaviour is not a forecast — see the honest-evaluation note below.
+
+## Evaluating performance honestly
+
+These signals are **not** demonstrated to be profitable, and short-horizon price
+moves are close to noise. Treat the tooling as measurement, not a profit oracle:
+
+- **Out-of-sample is the only number that counts.** A good in-sample backtest
+  proves nothing. Use the walk-forward harness, which optimises parameters on a
+  training window and reports only the unseen test folds:
+  ```bash
+  python backtest.py --watchlist --score --walkforward
+  ```
+- **Win rate alone can't tell skill from luck.** The backtest and `/stats` now
+  report Sharpe/Sortino, a t-stat, and a 95% CI on the mean return. If the CI
+  straddles 0, there is no demonstrable edge yet — regardless of win rate.
+- **Survivorship bias** is present until dated universe snapshots accumulate
+  (the bot writes one per day; see `universe.py`). Backtests print a warning
+  while biased.
+- **Channel tips** are scored on the channel's *own* posted levels
+  (`channel_call` in `/stats`), captured immutably at receipt — so you can see
+  whether a source is actually any good, not whether the bot's re-analysis was.
+- All P&L is hypothetical, gross of slippage, and optimistic on fills. Realised,
+  cost-inclusive results will be worse.
 
 ## Going live (broker integration)
 

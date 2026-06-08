@@ -163,6 +163,23 @@ class TelethonListener:
             return  # silent — not every channel post is a tip
 
         self.tip_count += 1
+
+        # HIGH-4: immutably record the tip AS POSTED, at receipt, before any
+        # analysis — the call-time audit trail that makes honest channel
+        # evaluation possible and forecloses any later lookahead.
+        try:
+            import subscriptions
+            msg_id = getattr(event.message, "id", None)
+            subscriptions.log_raw_tip(
+                channel=channel, msg_id=msg_id,
+                symbol=tip.get("symbol"), action=tip.get("action"),
+                entry=tip.get("entry"), target=tip.get("target"),
+                target2=tip.get("target2"), stop_loss=tip.get("sl"),
+                raw_text=tip.get("raw_text") or tip.get("_ocr_text") or "",
+            )
+        except Exception as e:
+            logger.warning("log_raw_tip failed for @%s: %s", channel, e)
+
         await self._evaluate_and_deliver(channel, tip)
 
     async def _evaluate_and_deliver(self, channel: str, tip: dict) -> None:
@@ -306,6 +323,28 @@ class TelethonListener:
             except Exception as e:
                 logger.warning("channel tip log_alert failed for %s: %s",
                                result.get("symbol"), e)
+
+        # HIGH-4: ALSO track the CHANNEL's own stated levels (entry/target/SL)
+        # as a distinct `channel_call` scorecard, so /stats measures the channel
+        # itself — not our re-derived signal. Requires entry+target+SL from the
+        # post; T2 falls back to T1 when the channel gave only one target.
+        if all(tip.get(k) is not None for k in ("entry", "target", "sl")):
+            try:
+                import subscriptions
+                subscriptions.log_alert(
+                    category="channel_call",
+                    user_id=self.notify_user_id,
+                    symbol=normalize_symbol(tip["symbol"]),
+                    setup=f"@{channel}",
+                    direction="long" if tip["action"] == "BUY" else "short",
+                    entry=float(tip["entry"]),
+                    stop_loss=float(tip["sl"]),
+                    target1=float(tip["target"]),
+                    target2=float(tip.get("target2") or tip["target"]),
+                )
+            except Exception as e:
+                logger.warning("channel_call log_alert failed for %s: %s",
+                               tip.get("symbol"), e)
 
         # `result` is the swing analysis from the standard gate (BUY/SELL,
         # ≥ SWING_MIN_CONFIDENCE) — no need to re-analyze.

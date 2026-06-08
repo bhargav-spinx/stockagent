@@ -75,6 +75,25 @@ def init_db() -> None:
                 target2       REAL NOT NULL
             )
         """)
+        # Immutable, append-only record of every parsed channel tip AS POSTED,
+        # captured at receipt BEFORE any analysis or outcome is known. This is
+        # the audit trail that makes honest channel evaluation possible and
+        # rules out any later lookahead (the call-time levels are frozen here).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS raw_tips (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                received_at   DATETIME NOT NULL,
+                channel       TEXT NOT NULL,
+                msg_id        INTEGER,
+                symbol        TEXT,
+                action        TEXT,
+                entry         REAL,
+                target        REAL,
+                target2       REAL,
+                stop_loss     REAL,
+                raw_text      TEXT
+            )
+        """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS alert_outcomes (
                 alert_id     INTEGER PRIMARY KEY,
@@ -240,6 +259,38 @@ def get_eod_subscribers() -> list[int]:
         return [r[0] for r in c.execute(
             "SELECT user_id FROM eod_report_subscribers"
         ).fetchall()]
+
+
+# ---------- immutable raw-tip capture (channel accountability) ----------
+
+def log_raw_tip(
+    *,
+    channel: str,
+    msg_id: int | None,
+    symbol: str | None,
+    action: str | None,
+    entry: float | None,
+    target: float | None,
+    target2: float | None,
+    stop_loss: float | None,
+    raw_text: str,
+    received_at: datetime | None = None,
+) -> int:
+    """Append a channel tip exactly as parsed, at receipt. Append-only — never
+    updated — so it is an immutable call-time record. Returns the new row id."""
+    received_at = received_at or datetime.utcnow()
+    with _conn() as c:
+        cur = c.execute(
+            """
+            INSERT INTO raw_tips
+                (received_at, channel, msg_id, symbol, action,
+                 entry, target, target2, stop_loss, raw_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (received_at.isoformat(), channel, msg_id, symbol, action,
+             entry, target, target2, stop_loss, raw_text[:1000]),
+        )
+        return cur.lastrowid
 
 
 # ---------- alerts log + outcomes ----------

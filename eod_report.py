@@ -5,18 +5,23 @@ For every alert logged today (and recent open swing alerts), simulate the
 hypothetical outcome assuming the user took the trade at the published
 Entry/SL/T1/T2 with the default 50/50 partial-exit rules from STRATEGY.md §7.
 
-Outcome categories:
-    t2_hit              — T2 reached → +1.5% blended (50% at T1, 50% at T2)
+Outcome categories (P&L is blended 50/50 from the ACTUAL entry/T1/T2 levels,
+never a fixed percentage — the targets are ATR-sized, so their distance varies
+per stock; see scanner_indicators.trade_levels):
+    t2_hit              — T2 reached → blended 50% at T1 + 50% at T2
     t1_then_squareoff   — T1 hit then session ended → blended 50% at T1 + 50% at last close
-    t1_then_breakeven   — T1 hit, then trailing-SL at entry → +0.5% blended
+    t1_then_breakeven   — T1 hit, then trailing-SL at entry → blended 50% at T1 + 50% at entry
     sl_hit              — SL hit before T1 → full SL distance loss
     time_stop           — 45 min elapsed without T1/SL (intraday only) → exit at last close
     squareoff_no_t1     — no T1, no SL, market closed → exit at last close
     open                — swing alerts not yet resolved
     no_data             — could not fetch post-entry candles
 
-P&L is hypothetical, gross of brokerage/STT/slippage. Apply ~0.13%/round-trip
-per STRATEGY.md §8 to estimate net.
+P&L is hypothetical and OPTIMISTIC on fills: it assumes the published SL/T1/T2
+fill at their exact price within the touching candle (no gap-through on stops,
+no spread, no partial-fill on the second leg). It is gross of brokerage/STT/
+slippage — apply ~0.13%/round-trip per STRATEGY.md §8 to estimate net, and treat
+real outcomes as somewhat worse than these figures.
 """
 from __future__ import annotations
 
@@ -41,7 +46,10 @@ COST_PER_TRADE_PCT = 0.13
 INTRADAY_CATEGORIES = {"scan", "manual_intraday"}
 # Channel tips are analysed on daily candles (swing horizon), so they resolve
 # and report through the swing machinery.
-SWING_CATEGORIES = {"swing_auto", "manual_swing", "channel_tip"}
+#   channel_tip  — OUR analysis of the tip (the bot's own levels)
+#   channel_call — the CHANNEL's own stated entry/target/SL (so the channel,
+#                  not the bot, gets an accountable scorecard)
+SWING_CATEGORIES = {"swing_auto", "manual_swing", "channel_tip", "channel_call"}
 
 PASS_STATUSES = {"t2_hit", "t1_then_squareoff", "t1_then_breakeven"}
 FAIL_STATUSES = {"sl_hit"}
@@ -62,6 +70,17 @@ def _signed_pct(entry: float, exit_price: float, direction: str) -> float:
     if direction == "long":
         return (exit_price - entry) / entry * 100
     return (entry - exit_price) / entry * 100
+
+
+def _blended_pct(entry: float, leg1_exit: float, leg2_exit: float,
+                 direction: str) -> float:
+    """Blended P&L for the 50/50 partial-exit model: half the position exits at
+    `leg1_exit` (T1), half at `leg2_exit` (T2 / trailed-SL / squareoff close).
+    BOTH legs are priced from the actual levels — never hardcoded — so the
+    result tracks the configured ATR-sized targets instead of an obsolete
+    fixed-percent assumption."""
+    return (0.5 * _signed_pct(entry, leg1_exit, direction)
+            + 0.5 * _signed_pct(entry, leg2_exit, direction))
 
 
 def resolve_intraday(alert: dict[str, Any],
@@ -136,12 +155,12 @@ def resolve_intraday(alert: dict[str, Any],
                 t1_hit_time = ts
                 # Check t2 in same candle
                 if t2_in:
-                    # 50% at T1 (1%), 50% at T2 (2%) → blended 1.5%
+                    # 50% at T1, 50% at T2 — blended from actual levels.
                     return {
                         "status": "t2_hit",
                         "exit_price": t2,
                         "exit_time": ts,
-                        "pnl_pct": 1.5,
+                        "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2),
                     }
         else:
             # After T1: SL is moved to entry per §7
@@ -157,29 +176,27 @@ def resolve_intraday(alert: dict[str, Any],
                     "status": "t2_hit",
                     "exit_price": t2,
                     "exit_time": ts,
-                    "pnl_pct": 1.5,
+                    "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2),
                 }
             if trail_sl_in:
-                # 50% at T1 (1%), 50% at entry (0%) → blended 0.5%
+                # 50% booked at T1, 50% trailed out at entry (0%).
                 return {
                     "status": "t1_then_breakeven",
                     "exit_price": entry,
                     "exit_time": ts,
-                    "pnl_pct": 0.5,
+                    "pnl_pct": round(_blended_pct(entry, t1, entry, direction), 2),
                 }
 
     # End of candles: square off at last close
     last_ts = post.index[-1]
     last_close = float(post["Close"].iloc[-1])
     if t1_hit:
-        # 50% at T1 (1%) + 50% at last close
-        remainder_pct = _signed_pct(entry, last_close, direction)
-        blended = (1.0 + remainder_pct) / 2
+        # 50% booked at T1 + 50% squared off at last close — both from actuals.
         return {
             "status": "t1_then_squareoff",
             "exit_price": last_close,
             "exit_time": last_ts,
-            "pnl_pct": round(blended, 2),
+            "pnl_pct": round(_blended_pct(entry, t1, last_close, direction), 2),
         }
     return {
         "status": "squareoff_no_t1",
@@ -241,7 +258,7 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
                         "status": "t2_hit",
                         "exit_price": t2,
                         "exit_time": ts,
-                        "pnl_pct": 1.5,
+                        "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2),
                     }
         else:
             if direction == "long":
@@ -251,10 +268,12 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
                 trail_sl_in = row["High"] >= entry
                 t2_in_now = row["Low"] <= t2
             if t2_in_now:
-                return {"status": "t2_hit", "exit_price": t2, "exit_time": ts, "pnl_pct": 1.5}
+                return {"status": "t2_hit", "exit_price": t2, "exit_time": ts,
+                        "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2)}
             if trail_sl_in:
                 return {"status": "t1_then_breakeven", "exit_price": entry,
-                        "exit_time": ts, "pnl_pct": 0.5}
+                        "exit_time": ts,
+                        "pnl_pct": round(_blended_pct(entry, t1, entry, direction), 2)}
 
     return {"status": "open"}
 
