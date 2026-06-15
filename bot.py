@@ -59,9 +59,34 @@ from data_provider import fetch_data as _fetch_data
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
 )
 logger = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    """Tune logging for production: honour LOG_LEVEL, quiet chatty third-party
+    libraries, and optionally tee to a rotating file when LOG_FILE is set."""
+    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    logging.getLogger().setLevel(level)
+
+    # These libraries log every HTTP request / update at INFO — too noisy.
+    for noisy in ("httpx", "httpcore", "telegram", "telethon", "apscheduler",
+                  "asyncio", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    log_file = os.getenv("LOG_FILE")
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+        try:
+            fh = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5,
+                                     encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            logging.getLogger().addHandler(fh)
+            logger.info("File logging enabled → %s (5MB × 5 rotated)", log_file)
+        except Exception as e:
+            logger.warning("LOG_FILE set but file handler failed: %s", e)
 
 # Watchlists are persisted in SQLite via subscriptions.user_watchlist.
 # See add_to_watchlist / remove_from_watchlist / get_watchlist.
@@ -1649,13 +1674,99 @@ async def _post_init(app: Application) -> None:
         logger.warning("Telethon listener init failed: %s", e)
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for exceptions raised inside any handler. Logs full context and
+    sends the user a friendly message instead of failing silently."""
+    logger.exception("Unhandled exception in handler: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong handling that. It's been logged — "
+                "please try again in a moment.")
+    except Exception as e:
+        logger.warning("error_handler: failed to notify user: %s", e)
+
+
+_BACKGROUND_TASK_KEYS = (
+    "autoscan_task", "swing_alert_task", "eod_report_task",
+    "swing_outcome_task", "heartbeat_task", "telethon_task",
+)
+
+
+async def _post_shutdown(app: Application) -> None:
+    """Cancel background loops and disconnect Telethon cleanly on shutdown so we
+    don't leak 'task was destroyed but it is pending' warnings or an open
+    Telethon session. Runs on Ctrl+C / SIGTERM via python-telegram-bot."""
+    # Disconnect Telethon first so run_until_disconnected returns.
+    listener = app.bot_data.get("telethon_listener")
+    if listener is not None:
+        try:
+            await listener.stop()
+        except Exception as e:
+            logger.warning("shutdown: Telethon stop failed: %s", e)
+
+    tasks = [app.bot_data.get(k) for k in _BACKGROUND_TASK_KEYS]
+    tasks = [t for t in tasks if t is not None and not t.done()]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("shutdown: cancelled %d background task(s)", len(tasks))
+
+
 # ---------- Main ----------
 
-def main():
+def _validate_config() -> None:
+    """Fail fast on misconfiguration, with actionable messages, before the bot
+    starts. Catches the partial-credential traps that otherwise surface as
+    confusing runtime errors on the first data fetch or webhook call."""
     if not TOKEN:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env file")
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN in your .env file (get one from @BotFather).")
 
-    builder = Application.builder().token(TOKEN).post_init(_post_init)
+    # Angel One is all-or-nothing: if the API key is set, the data layer routes
+    # to Angel and will crash on the first fetch if any credential is missing.
+    if os.getenv("ANGEL_API_KEY"):
+        missing = [k for k in ("ANGEL_CLIENT_CODE", "ANGEL_PASSWORD", "ANGEL_TOTP_SECRET")
+                   if not os.getenv(k)]
+        if missing:
+            raise SystemExit(
+                "ANGEL_API_KEY is set but these are missing: "
+                f"{', '.join(missing)}. Set them in .env, or unset ANGEL_API_KEY "
+                "to fall back to Yahoo Finance (delayed).")
+
+    # Webhook mode needs a well-formed HTTPS URL and a non-default secret.
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        if not webhook_url.startswith("https://"):
+            raise SystemExit(f"WEBHOOK_URL must be https:// (got: {webhook_url}).")
+        try:
+            int(os.getenv("PORT", "8080"))
+        except ValueError:
+            raise SystemExit(f"PORT must be an integer (got: {os.getenv('PORT')!r}).")
+        if not os.getenv("WEBHOOK_SECRET"):
+            logger.warning("WEBHOOK_SECRET is unset — using a guessable default "
+                           "path. Set WEBHOOK_SECRET to a random string.")
+
+    # Telethon is opt-in; warn (don't fail) if it's partially configured.
+    tele = {k: os.getenv(k) for k in ("TELETHON_API_ID", "TELETHON_API_HASH",
+            "TELETHON_PHONE", "TELETHON_CHANNELS", "TELETHON_NOTIFY_USER_ID")}
+    set_keys = [k for k, v in tele.items() if v]
+    if set_keys and len(set_keys) < len(tele):
+        logger.warning("Telethon partially configured (%s set) — listener will "
+                       "stay DISABLED until all TELETHON_* vars are present.",
+                       ", ".join(set_keys))
+
+    if DISABLE_SSL_VERIFY:
+        logger.warning("⚠️  DISABLE_SSL_VERIFY=true — TLS verification is OFF "
+                       "globally. This is a local-dev workaround only; never run "
+                       "with this enabled in production.")
+
+
+def main():
+    _setup_logging()
+    _validate_config()
+
+    builder = Application.builder().token(TOKEN).post_init(_post_init).post_shutdown(_post_shutdown)
 
     # Local-dev: skip TLS verification for python-telegram-bot's httpx client
     # when behind a corp SSL-inspecting proxy. Only when DISABLE_SSL_VERIFY=true.
@@ -1702,6 +1813,7 @@ def main():
     app.add_handler(CommandHandler("angel_status", angel_status_cmd))
     app.add_handler(CommandHandler("angel_login", angel_login_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_error_handler(_error_handler)
     # Tip handlers — must come BEFORE the bare text_handler so forwarded
     # text and group-chat tips aren't treated as ticker lookups.
     # 1. Forwarded messages in private chat
