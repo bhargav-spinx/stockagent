@@ -49,13 +49,8 @@ def test_slice_with_context_no_forward_leak():
     assert min(sub.index.date) == pd.Timestamp(2026, 1, 5).date()
 
 
-def test_walkforward_optimises_train_applies_to_test(monkeypatch=None):
+def test_walkforward_optimises_train_applies_to_test():
     df = _synth_df()
-
-    # fetch returns our synthetic frame for any symbol
-    backtest._fetch_5m = lambda sym, days: (
-        (sym if "." in sym else sym + ".NS"), df)
-
     GOOD = (0.004, 0.015)
 
     def fake_sim(df_, sym, setup_filter=None, atr_lo=None, atr_hi=None,
@@ -71,12 +66,18 @@ def test_walkforward_optimises_train_applies_to_test(monkeypatch=None):
                 status="t2_hit", pnl_gross_pct=pnl))
         return trades, len(entry_dates or []), {}
 
+    # Patch module globals, then ALWAYS restore so a pytest session stays clean.
+    orig_fetch, orig_sim = backtest._fetch_5m, backtest._simulate_setups
+    backtest._fetch_5m = lambda sym, days: (
+        (sym if "." in sym else sym + ".NS"), df)
     backtest._simulate_setups = fake_sim
-
-    grid = [GOOD, (0.003, 0.020)]
-    res = backtest.walk_forward(
-        ["TEST"], days=30, score_mode=False,
-        n_folds=3, train_folds=1, grid=grid)
+    try:
+        grid = [GOOD, (0.003, 0.020)]
+        res = backtest.walk_forward(
+            ["TEST"], days=30, score_mode=False,
+            n_folds=3, train_folds=1, grid=grid)
+    finally:
+        backtest._fetch_5m, backtest._simulate_setups = orig_fetch, orig_sim
 
     assert res is not None
     # 3 folds, train_folds=1 -> test folds at index 1 and 2 = 2 test folds

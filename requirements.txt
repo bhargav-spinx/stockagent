@@ -19,3 +19,8 @@ Pillow
 # Telethon: listen to public Telegram channels via your USER account
 # (separate from Bot API). Used by telethon_listener.py for channel monitoring.
 telethon
+
+# --- Dev / CI only (not needed at runtime) ---
+# Test runner for tests/. CI installs a minimal subset (pandas numpy pytz
+# python-dotenv pytest) rather than the full file — see .github/workflows/ci.yml.
+pytest
