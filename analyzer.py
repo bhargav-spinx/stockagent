@@ -5,7 +5,7 @@ Pulls NSE/BSE data and runs technical analysis to generate buy/sell/hold signals
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from data_provider import fetch_data, get_provider_name
 from constants import IST
@@ -74,10 +74,15 @@ def is_nse_open() -> bool:
 # ---------- Technical Indicators ----------
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI — uses Wilder smoothing (RMA = EMA with alpha=1/period),
+    matching TradingView / Zerodha / standard charting platforms. (Previously
+    used a simple moving average, which diverges from every chart.)"""
     delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
@@ -99,7 +104,9 @@ def bollinger_bands(series: pd.Series, period: int = 20, std_dev: int = 2):
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range — standard volatility measure used to size stops."""
+    """Average True Range (Wilder) — uses Wilder smoothing (RMA), the standard
+    ATR definition used by charting platforms and by Supertrend. (Previously a
+    simple moving average of TR, which gives different stop/target distances.)"""
     high = df["High"]
     low = df["Low"]
     prev_close = df["Close"].shift()
@@ -108,7 +115,48 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def _interval_minutes(interval: str) -> int | None:
+    """Parse a yfinance-style interval ('5m', '15m', '1h') into minutes."""
+    s = interval.strip().lower()
+    try:
+        if s.endswith("m"):
+            return int(s[:-1])
+        if s.endswith("h"):
+            return int(s[:-1]) * 60
+    except ValueError:
+        return None
+    return None
+
+
+def drop_forming_candle(df: pd.DataFrame, interval: str,
+                        now: datetime | None = None) -> pd.DataFrame:
+    """Drop the last row when it is a still-FORMING (not-yet-closed) candle, so
+    live signals don't repaint as the current candle ticks.
+
+    Apply ONLY at live signal-generation sites (analyze / scan_one / score_one /
+    index_trend). Backtests must NOT use this — they already operate on closed
+    candle slices, and dropping there would discard the intended trigger bar.
+
+    - Intraday (e.g. '5m'): the bar timestamped t is complete only once
+      now >= t + interval.
+    - Daily ('1d'): today's bar is incomplete until the 15:30 IST close.
+    """
+    if len(df) < 2:
+        return df
+    now = now or datetime.now(IST)
+    last = df.index[-1].to_pydatetime()
+    last = IST.localize(last) if last.tzinfo is None else last.astimezone(IST)
+
+    mins = _interval_minutes(interval)
+    if mins:
+        return df.iloc[:-1] if now < last + timedelta(minutes=mins) else df
+    # Daily / unknown: today's session bar isn't final until the close.
+    if last.date() == now.date() and now.time() < time(15, 30):
+        return df.iloc[:-1]
+    return df
 
 
 def build_trade_setup(df: pd.DataFrame, signal: str, last_price: float,
@@ -194,6 +242,8 @@ def analyze(symbol: str, mode: str = "swing") -> dict:
 
     sym = normalize_symbol(symbol)
     df = fetch_data(sym, period=cfg["period"], interval=cfg["interval"])
+    # Live signal: drop the still-forming candle so the call doesn't repaint.
+    df = drop_forming_candle(df, cfg["interval"])
     close = df["Close"]
 
     if len(close) < cfg["sma_long"] + 2:

@@ -168,6 +168,8 @@ def index_trend(aliases=("NIFTY", "BANKNIFTY")) -> dict:
     for alias in aliases:
         try:
             df = fetch_data(alias, period="5d", interval="5m")
+            from analyzer import drop_forming_candle
+            df = drop_forming_candle(df, "5m")   # live: ignore unclosed candle
             today, _ = split_sessions(df)
             if len(today) < 3:
                 continue

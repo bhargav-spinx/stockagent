@@ -28,7 +28,7 @@ import ssl_dev  # noqa: E402
 ssl_dev.install_if_enabled()
 
 from data_provider import fetch_data  # noqa: E402
-from analyzer import normalize_symbol  # noqa: E402
+from analyzer import normalize_symbol, drop_forming_candle  # noqa: E402
 from scanner_filters import apply_universal_filters  # noqa: E402
 from scanner_setups import ALL_DETECTORS, Signal, signal_metrics  # noqa: E402
 from universe import (  # noqa: E402
@@ -59,6 +59,7 @@ def scan_one(symbol: str, check_time: bool = True) -> dict:
         df = fetch_data(sym, period="5d", interval="5m")
     except Exception as e:
         return {"symbol": sym, "status": "error", "reason": str(e)}
+    df = drop_forming_candle(df, "5m")   # live: ignore the unclosed candle
 
     if len(df) < 30:
         return {"symbol": sym, "status": "skip",
@@ -96,6 +97,7 @@ def score_one(symbol: str, idx_trend: dict | None = None) -> dict:
         df = fetch_data(sym, period="5d", interval="5m")
     except Exception as e:
         return {"symbol": sym, "status": "error", "reason": str(e)}
+    df = drop_forming_candle(df, "5m")   # live: ignore the unclosed candle
     if len(df) < 30:
         return {"symbol": sym, "status": "error",
                 "reason": f"Insufficient data ({len(df)} candles)"}
