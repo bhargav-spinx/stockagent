@@ -1824,14 +1824,17 @@ def main():
     # Optional client-side rate limiting so large broadcasts can't trip
     # Telegram's flood limits. Enabled only if the extra is installed
     # (pip install "python-telegram-bot[rate-limiter]"); otherwise no-op.
+    # NOTE: AIORateLimiter imports fine even without the `aiolimiter` extra —
+    # it raises RuntimeError only when *instantiated*. So catch broadly here;
+    # the rate limiter must never be able to crash startup.
     try:
         from telegram.ext import AIORateLimiter
         builder = builder.rate_limiter(AIORateLimiter())
         logger.info("AIORateLimiter enabled")
-    except ImportError:
-        logger.info("Rate limiter not installed — broadcasts run unthrottled "
+    except Exception as e:
+        logger.info("Rate limiter unavailable (%s) — broadcasts run unthrottled "
                     "(fine for small subscriber lists). Install with "
-                    "'python-telegram-bot[rate-limiter]' to enable.")
+                    "'python-telegram-bot[rate-limiter]' to enable.", e)
 
     # Local-dev: skip TLS verification for python-telegram-bot's httpx client
     # when behind a corp SSL-inspecting proxy. Only when DISABLE_SSL_VERIFY=true.
