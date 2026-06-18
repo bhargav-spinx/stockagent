@@ -32,7 +32,7 @@ if DISABLE_SSL_VERIFY:
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes, filters, TypeHandler, ApplicationHandlerStop,
 )
 from telegram.request import HTTPXRequest
 
@@ -62,6 +62,50 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------- Access control (personal-use allowlist) ----------
+# This bot gives BUY/SELL/target calls. Distributing those to others can bring it
+# under SEBI Research Analyst scope; leaving it open also invites resource abuse.
+# AUTHORIZED_USERS (comma-separated numeric Telegram user IDs) restricts ALL
+# interaction to the owner. The Telethon notify user is auto-included.
+def _authorized_user_ids() -> set[int]:
+    ids: set[int] = set()
+    for part in os.getenv("AUTHORIZED_USERS", "").replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning("AUTHORIZED_USERS: ignoring non-numeric id %r", part)
+    notify = os.getenv("TELETHON_NOTIFY_USER_ID")
+    if notify:
+        try:
+            ids.add(int(notify))
+        except ValueError:
+            pass
+    return ids
+
+
+AUTHORIZED_USERS = _authorized_user_ids()
+
+
+async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler (group=-1). If an allowlist is configured
+    and the sender isn't on it, reply once and stop the update — keeping this a
+    private, personal-use bot. No allowlist set ⇒ open mode (startup warns)."""
+    if not AUTHORIZED_USERS:
+        return
+    user = update.effective_user
+    if user is None or user.id not in AUTHORIZED_USERS:
+        logger.info("blocked unauthorized user_id=%s", getattr(user, "id", None))
+        try:
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "🔒 Private bot — access is restricted to the owner.")
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
 
 
 def _setup_logging() -> None:
@@ -1761,6 +1805,15 @@ def _validate_config() -> None:
                        "globally. This is a local-dev workaround only; never run "
                        "with this enabled in production.")
 
+    if not AUTHORIZED_USERS:
+        logger.warning(
+            "⚠️  AUTHORIZED_USERS is empty — the bot is OPEN to ANY Telegram user "
+            "who finds it. They can subscribe to your BUY/SELL alerts (turning "
+            "personal use into public distribution — a SEBI exposure) and consume "
+            "resources. Set AUTHORIZED_USERS to your numeric Telegram user id(s).")
+    else:
+        logger.info("Access restricted to %d authorized user(s)", len(AUTHORIZED_USERS))
+
 
 def main():
     _setup_logging()
@@ -1788,6 +1841,8 @@ def main():
         builder = builder.request(req).get_updates_request(get_updates_req)
 
     app = builder.build()
+    # Access control FIRST (group=-1): block non-owners before any handler runs.
+    app.add_handler(TypeHandler(Update, _auth_gate), group=-1)
     # Onboarding
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("guide", guide_cmd))

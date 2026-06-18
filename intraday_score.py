@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from constants import DISCLAIMER
 from scanner_indicators import (
     vwap, ema, supertrend,
     localize_ist, split_sessions, orb_levels, volume_ratio, trade_levels,
@@ -423,4 +424,5 @@ def format_scorecard(c: ScoreCard) -> str:
         lines += ["", "_" + "  ·  ".join(c.context) + "_"]
     if c.notes:
         lines += ["⚠️ " + "; ".join(c.notes)]
+    lines += ["", DISCLAIMER]
     return "\n".join(lines)
