@@ -32,6 +32,9 @@ def is_intraday_entry_window(now: datetime | None = None) -> bool:
     now = now or datetime.now(IST)
     if now.weekday() >= 5:
         return False
+    from market_calendar import is_trading_holiday
+    if is_trading_holiday(now.date()):
+        return False
     t = now.time()
     if t < time(9, 30) or t >= time(14, 30):
         return False
@@ -48,6 +51,9 @@ def time_window_filter(now: datetime | None = None) -> FilterResult:
     now = now or datetime.now(IST)
     if now.weekday() >= 5:
         return FilterResult(False, "Weekend — NSE closed")
+    from market_calendar import is_trading_holiday
+    if is_trading_holiday(now.date()):
+        return FilterResult(False, "NSE trading holiday")
     t = now.time()
     if t < time(9, 30):
         return FilterResult(False, "Before 09:30 — ORB still forming")

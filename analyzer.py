@@ -64,9 +64,12 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def is_nse_open() -> bool:
-    """NSE trading hours: 09:15-15:30 IST, Mon-Fri."""
+    """NSE trading hours: 09:15-15:30 IST, Mon-Fri, excluding trading holidays."""
     now = datetime.now(IST)
     if now.weekday() >= 5:
+        return False
+    from market_calendar import is_trading_holiday
+    if is_trading_holiday(now.date()):
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
 
@@ -97,7 +100,9 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 def bollinger_bands(series: pd.Series, period: int = 20, std_dev: int = 2):
     sma = series.rolling(period).mean()
-    std = series.rolling(period).std()
+    # Population std (ddof=0) to match TradingView/Zerodha Bollinger Bands;
+    # pandas defaults to sample std (ddof=1), which widens the bands slightly.
+    std = series.rolling(period).std(ddof=0)
     upper = sma + (std * std_dev)
     lower = sma - (std * std_dev)
     return upper, sma, lower

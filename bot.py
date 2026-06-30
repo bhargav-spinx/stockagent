@@ -724,6 +724,15 @@ AUTOSCAN_MAX_ALERTS = 5    # cap: send only the N highest-scoring per pass
 AUTOSCAN_MAX_DAILY = 8     # risk cap: stop firing once this many fired today
 
 
+# Hard timeouts so a hung Angel/yfinance call can't freeze a 24/7 loop.
+# A blocked fetch otherwise stalls the tick forever while the service looks
+# "active". On timeout we skip the tick; the orphaned worker thread is abandoned
+# (Python can't cancel threads) but the loop stays responsive.
+INDEX_TREND_TIMEOUT_SEC = 60
+AUTOSCAN_SCAN_TIMEOUT_SEC = 280       # < AUTOSCAN_INTERVAL_SEC (300)
+SWING_SYMBOL_TIMEOUT_SEC = 30
+
+
 async def _autoscan_tick(app: Application) -> None:
     """One pass of the auto-scan loop. Safe to call any time; no-ops outside market hours."""
     _reset_daily_stats_if_new_day()
@@ -738,9 +747,22 @@ async def _autoscan_tick(app: Application) -> None:
     logger.info("autoscan: scoring %d symbols for %d subscriber(s)",
                 len(INTRADAY_UNIVERSE), len(subs))
     # Market-index trend fetched once; shared across all symbols this pass.
-    idx = await asyncio.to_thread(intraday_score.index_trend)
     try:
-        results = await asyncio.to_thread(score_many, INTRADAY_UNIVERSE, idx)
+        idx = await asyncio.wait_for(
+            asyncio.to_thread(intraday_score.index_trend),
+            timeout=INDEX_TREND_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.error("autoscan: index_trend timed out after %ss — using empty regime",
+                     INDEX_TREND_TIMEOUT_SEC)
+        idx = {}
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(score_many, INTRADAY_UNIVERSE, idx),
+            timeout=AUTOSCAN_SCAN_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.error("autoscan: score_many timed out after %ss — skipping this tick "
+                     "(data feed slow/hung)", AUTOSCAN_SCAN_TIMEOUT_SEC)
+        return
     except Exception as e:
         logger.exception("autoscan: score_many crashed: %s", e)
         return
@@ -1324,8 +1346,15 @@ async def _swing_alert_tick(app: Application) -> None:
         scanned = 0
         for symbol in watchlist:
             try:
-                result = await asyncio.to_thread(analyze, symbol, "swing")
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(analyze, symbol, "swing"),
+                    timeout=SWING_SYMBOL_TIMEOUT_SEC)
                 scanned += 1
+            except asyncio.TimeoutError:
+                logger.warning("swing analyze timed out for %s/%s after %ss — skipping",
+                               uid, symbol, SWING_SYMBOL_TIMEOUT_SEC)
+                await asyncio.sleep(SCAN_PACING_SEC)
+                continue
             except Exception as e:
                 logger.warning("swing analyze failed for %s/%s: %s", uid, symbol, e)
                 await asyncio.sleep(SCAN_PACING_SEC)
@@ -1497,6 +1526,14 @@ async def _eod_report_tick(app: Application) -> None:
         logger.info("EOD: universe snapshot written → %s", snap)
     except Exception as e:
         logger.warning("EOD: universe snapshot failed: %s", e)
+
+    # Once-daily conservative cleanup of very old rows (keeps ~2y of stats).
+    try:
+        purged = await asyncio.to_thread(subscriptions.purge_old_data)
+        if any(purged.values()):
+            logger.info("EOD: purged old rows %s", purged)
+    except Exception as e:
+        logger.warning("EOD: purge_old_data failed: %s", e)
 
     subs = subscriptions.get_eod_subscribers()
     if not subs:

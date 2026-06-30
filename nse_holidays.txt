@@ -1,0 +1,30 @@
+# NSE equity trading holidays — full-day closures (the bot skips scans on these).
+# Format: one ISO date (YYYY-MM-DD) per line. Inline "# comment" is allowed.
+# Blank lines and lines starting with # are ignored.
+#
+# PRE-FILLED: only FIXED-date holidays (always on the same Gregorian date).
+# YOU MUST ADD the variable/lunar 2026 holidays (Holi, Eid/Ramzan Id, Ram Navami,
+# Good Friday, Bakri Id, Muharram, Ganesh Chaturthi, Dussehra, Diwali Laxmi Pujan,
+# Diwali Balipratipada, Guru Nanak Jayanti, etc.) from the official NSE circular:
+#   https://www.nseindia.com/resources/exchange-communication-holidays
+# Including a date that lands on a weekend is harmless (weekends are skipped anyway).
+
+# ---- Fixed-date holidays ----
+2026-01-26   # Republic Day
+2026-05-01   # Maharashtra Day
+2026-08-15   # Independence Day
+2026-10-02   # Gandhi Jayanti
+2026-12-25   # Christmas
+
+# ---- Variable/lunar 2026 holidays — VERIFY against NSE circular, then add below ----
+# 2026-MM-DD   # Holi
+# 2026-MM-DD   # Ramzan Id (Eid-ul-Fitr)
+# 2026-MM-DD   # Ram Navami
+# 2026-MM-DD   # Good Friday
+# 2026-MM-DD   # Bakri Id (Eid-ul-Adha)
+# 2026-MM-DD   # Muharram
+# 2026-MM-DD   # Ganesh Chaturthi
+# 2026-MM-DD   # Dussehra
+# 2026-MM-DD   # Diwali — Laxmi Pujan (special muhurat session may still run)
+# 2026-MM-DD   # Diwali — Balipratipada
+# 2026-MM-DD   # Guru Nanak Jayanti

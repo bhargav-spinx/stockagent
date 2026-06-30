@@ -8,7 +8,7 @@ Two tables:
 """
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "stockagent.db"
@@ -132,7 +132,7 @@ def subscribe(user_id: int) -> None:
     with _conn() as c:
         c.execute(
             "INSERT OR IGNORE INTO scan_subscribers(user_id, subscribed_at) VALUES (?, ?)",
-            (user_id, datetime.utcnow().isoformat()),
+            (user_id, datetime.now(timezone.utc).isoformat()),
         )
 
 
@@ -158,7 +158,7 @@ def swing_subscribe(user_id: int) -> None:
     with _conn() as c:
         c.execute(
             "INSERT OR IGNORE INTO swing_subscribers(user_id, subscribed_at) VALUES (?, ?)",
-            (user_id, datetime.utcnow().isoformat()),
+            (user_id, datetime.now(timezone.utc).isoformat()),
         )
 
 
@@ -184,7 +184,7 @@ def add_to_watchlist(user_id: int, symbol: str) -> None:
     with _conn() as c:
         c.execute(
             "INSERT OR IGNORE INTO user_watchlist(user_id, symbol, added_at) VALUES (?, ?, ?)",
-            (user_id, symbol, datetime.utcnow().isoformat()),
+            (user_id, symbol, datetime.now(timezone.utc).isoformat()),
         )
 
 
@@ -227,7 +227,7 @@ def mark_fired(key: str) -> None:
     with _conn() as c:
         c.execute(
             "INSERT OR IGNORE INTO fired_signals(key, fired_at, trade_date) VALUES (?, ?, ?)",
-            (key, datetime.utcnow().isoformat(), today),
+            (key, datetime.now(timezone.utc).isoformat(), today),
         )
 
 
@@ -242,13 +242,40 @@ def purge_old_signals(keep_days: int = 2) -> int:
         return cur.rowcount
 
 
+def purge_old_data(alerts_keep_days: int = 730,
+                   raw_tips_keep_days: int = 365) -> dict[str, int]:
+    """Conservative cleanup so the DB doesn't grow unbounded. Retention is
+    deliberately long — ~2y of alerts/outcomes preserves the /stats performance
+    record; ~1y of raw channel tips. Returns rows deleted per table."""
+    with _conn() as c:
+        oc = c.execute(
+            "DELETE FROM alert_outcomes WHERE alert_id IN ("
+            "  SELECT id FROM alerts_log "
+            "  WHERE trade_date < date('now', '-' || ? || ' days'))",
+            (alerts_keep_days,),
+        ).rowcount
+        al = c.execute(
+            "DELETE FROM alerts_log "
+            "WHERE trade_date < date('now', '-' || ? || ' days')",
+            (alerts_keep_days,),
+        ).rowcount
+        # raw_tips.received_at is an ISO timestamp; compare on its date prefix
+        # (tz-suffix-agnostic) against the cutoff.
+        rt = c.execute(
+            "DELETE FROM raw_tips "
+            "WHERE substr(received_at, 1, 10) < date('now', '-' || ? || ' days')",
+            (raw_tips_keep_days,),
+        ).rowcount
+    return {"alert_outcomes": oc, "alerts_log": al, "raw_tips": rt}
+
+
 # ---------- end-of-day report subscriptions ----------
 
 def eod_subscribe(user_id: int) -> None:
     with _conn() as c:
         c.execute(
             "INSERT OR IGNORE INTO eod_report_subscribers(user_id, subscribed_at) VALUES (?, ?)",
-            (user_id, datetime.utcnow().isoformat()),
+            (user_id, datetime.now(timezone.utc).isoformat()),
         )
 
 
@@ -287,7 +314,7 @@ def log_raw_tip(
 ) -> int:
     """Append a channel tip exactly as parsed, at receipt. Append-only — never
     updated — so it is an immutable call-time record. Returns the new row id."""
-    received_at = received_at or datetime.utcnow()
+    received_at = received_at or datetime.now(timezone.utc)
     with _conn() as c:
         cur = c.execute(
             """
@@ -318,7 +345,7 @@ def log_alert(
     generated_at: datetime | None = None,
 ) -> int:
     """Insert an alert row. Returns new alert_id."""
-    generated_at = generated_at or datetime.utcnow()
+    generated_at = generated_at or datetime.now(timezone.utc)
     trade_date = date.today().isoformat()
     with _conn() as c:
         cur = c.execute(
@@ -405,7 +432,7 @@ def save_outcome(
             """,
             (alert_id, status, exit_price,
              exit_time.isoformat() if exit_time else None,
-             pnl_pct, datetime.utcnow().isoformat()),
+             pnl_pct, datetime.now(timezone.utc).isoformat()),
         )
 
 
