@@ -245,14 +245,41 @@ def fetch_angel(symbol: str, period: str, interval: str) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.set_index("timestamp")
     df.index = df.index.tz_convert(IST) if df.index.tz else df.index.tz_localize(IST)
+    _warn_unadjusted_split(df, symbol, angel_interval)
     return df
+
+
+def _warn_unadjusted_split(df: pd.DataFrame, symbol: str, angel_interval: str) -> None:
+    """Angel daily candles are NOT split/bonus-adjusted. A corporate action inside
+    the window leaves a price cliff that corrupts SMA/RSI/Bollinger/ATR and trade
+    levels. We can't back-adjust here (no action data in the candle API), but we
+    warn so the operator knows the window is suspect. Conservative threshold
+    (>40% adjacent-close gap) sits well beyond NSE circuit limits, so genuine
+    single-day moves won't trip it."""
+    if angel_interval != "ONE_DAY" or len(df) < 2:
+        return
+    close = df["Close"].astype(float)
+    ratio = close / close.shift(1)
+    bad = ratio[(ratio < 0.6) | (ratio > 1.66)]
+    if len(bad):
+        when = ", ".join(str(i.date()) for i in bad.index[:3])
+        logger.warning(
+            "%s: suspicious >40%% daily gap (%s) — likely an UNADJUSTED split/bonus "
+            "in Angel data; swing indicators/levels for this window may be wrong.",
+            symbol, when)
 
 
 # ---------- yfinance fallback ----------
 
 def fetch_yfinance(symbol: str, period: str, interval: str) -> pd.DataFrame:
     import yfinance as yf
-    df = yf.Ticker(symbol).history(period=period, interval=interval)
+    # Pin auto_adjust=True explicitly: yfinance's default flipped across versions,
+    # and unadjusted ('Close' = raw traded price) puts a split/bonus discontinuity
+    # into the series that corrupts SMA/RSI/Bollinger/ATR and the trade levels.
+    # auto_adjust=True back-adjusts OHLC for splits + dividends — correct for TA.
+    df = yf.Ticker(symbol).history(
+        period=period, interval=interval, auto_adjust=True, actions=False,
+    )
     if df.empty:
         raise ValueError(f"No yfinance data for {symbol}")
     return df
