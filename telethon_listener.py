@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from telegram.ext import Application
@@ -30,7 +31,11 @@ from constants import IST, SWING_MIN_CONFIDENCE
 
 logger = logging.getLogger(__name__)
 
-SESSION_NAME = "telethon_session"
+# Absolute, CWD-independent session path. A relative name would resolve against
+# the process working directory, so a systemd restart without a pinned
+# WorkingDirectory could load/create a DIFFERENT (unauthorized) .session and
+# silently fail to connect. Pin it next to this module instead.
+SESSION_NAME = str(Path(__file__).resolve().parent / "telethon_session")
 
 # --- "Our standard" gate (STRATEGY.md) ---------------------------------------
 # A parsed channel tip is forwarded only if it passes BOTH gates:
@@ -83,6 +88,7 @@ class TelethonListener:
         self.dropped_error = 0
         self._tips_since_summary = 0
         self.started_at: Optional[datetime] = None
+        self._stopping = False
 
     async def start(self) -> None:
         if not _enabled():
@@ -91,35 +97,89 @@ class TelethonListener:
 
         # Late import so a missing telethon package doesn't break bot startup
         from telethon import TelegramClient, events
+        from telethon.errors import FloodWaitError
 
         api_id = int(os.getenv("TELETHON_API_ID"))
         api_hash = os.getenv("TELETHON_API_HASH")
-        phone = os.getenv("TELETHON_PHONE")
 
         self.client = TelegramClient(SESSION_NAME, api_id, api_hash)
+        logger.info("Telethon session file: %s.session", SESSION_NAME)
 
         try:
-            await self.client.start(phone=phone)
+            await self.client.connect()
         except Exception as e:
-            logger.exception("Telethon login failed: %s", e)
+            logger.exception("Telethon connect failed: %s", e)
+            return
+
+        # Explicit auth check — never attempt interactive sign-in under systemd
+        # (it would block on input() and fail confusingly). A failed check here
+        # means the session was never created on this host OR has been revoked.
+        if not await self.client.is_user_authorized():
             logger.error(
-                "If this is the first run, you need to authenticate "
-                "interactively. Run: python auth_once.py"
-            )
+                "Telethon session NOT authorized (%s.session). It was never "
+                "created on this host, or has been revoked/expired. Re-authenticate "
+                "ON THIS VM: run `python auth_once.py` in %s, then restart the "
+                "service. Listener stays disabled until then.",
+                SESSION_NAME, str(Path(SESSION_NAME).parent))
             return
 
         me = await self.client.get_me()
-        logger.info("Telethon connected as %s (user_id=%s)", me.username or me.first_name, me.id)
+        logger.info("Telethon connected & AUTHORIZED as %s (user_id=%s)",
+                    me.username or me.first_name, me.id)
 
-        # Subscribe to each configured channel
+        # Resolve + register each channel. Logging the resolution makes a stale
+        # entity (account left / channel renamed or went private) visible.
+        resolved = 0
         for ch in self.channels:
+            try:
+                ent = await self.client.get_entity(ch)
+                title = getattr(ent, "title", None) or getattr(ent, "username", ch)
+                logger.info("Telethon channel @%s resolved -> id=%s title=%r",
+                            ch, getattr(ent, "id", "?"), title)
+                resolved += 1
+            except Exception as e:
+                logger.warning("Telethon channel @%s did NOT resolve — the account "
+                               "may have left it, or it was renamed/made private: %s",
+                               ch, e)
             self._register_channel(ch, events)
+            logger.info("Telethon NewMessage handler registered for @%s", ch)
+
+        if self.channels and resolved == 0:
+            logger.warning("Telethon: NONE of %d configured channel(s) resolved — "
+                           "the user account is probably not a member of any. Join "
+                           "them with that account.", len(self.channels))
 
         self.started_at = datetime.now(IST)
-        logger.info("Telethon listening on %d channel(s): %s", len(self.channels), self.channels)
+        logger.info("Telethon entering event loop — listening on %d channel(s): %s",
+                    len(self.channels), self.channels)
 
-        # Run forever
-        await self.client.run_until_disconnected()
+        # Supervised run. Previously a single run_until_disconnected() return
+        # (transient disconnect / FloodWait) silently ended the listener forever
+        # while the service stayed up. Reconnect with backoff so it self-heals.
+        backoff = 5
+        while not self._stopping:
+            try:
+                await self.client.run_until_disconnected()
+            except FloodWaitError as e:
+                logger.error("Telethon FloodWait — must wait %ss before retrying "
+                             "(usually from too-frequent reconnects)", e.seconds)
+                await asyncio.sleep(e.seconds + 5)
+                backoff = 5
+            except asyncio.CancelledError:
+                raise   # graceful shutdown — propagate, do not reconnect
+            except Exception as e:
+                logger.warning("Telethon run loop error: %s", e)
+            if self._stopping:
+                break
+            logger.warning("Telethon disconnected — reconnecting in %ss", backoff)
+            await asyncio.sleep(backoff)
+            try:
+                if not self.client.is_connected():
+                    await self.client.connect()
+            except Exception as e:
+                logger.warning("Telethon reconnect attempt failed: %s", e)
+            backoff = min(backoff * 2, 300)
+        logger.info("Telethon supervisor loop exited (stopping=%s)", self._stopping)
 
     def _register_channel(self, channel: str, events_module) -> None:
         @self.client.on(events_module.NewMessage(chats=channel))
@@ -370,6 +430,7 @@ class TelethonListener:
         )
 
     async def stop(self) -> None:
+        self._stopping = True   # tell the supervisor loop not to reconnect
         if self.client:
             await self.client.disconnect()
             logger.info("Telethon disconnected")
