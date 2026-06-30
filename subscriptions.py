@@ -16,8 +16,13 @@ DB_PATH = Path(__file__).parent / "stockagent.db"
 
 @contextmanager
 def _conn():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=30: wait up to 30s for a lock instead of erroring immediately.
+    # 5 background loops + command handlers + the Telethon listener all write
+    # this DB concurrently, so a 0s busy-timeout (the default) raises
+    # "database is locked" under contention.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
+        conn.execute("PRAGMA busy_timeout=30000")
         yield conn
         conn.commit()
     finally:
@@ -26,6 +31,10 @@ def _conn():
 
 def init_db() -> None:
     with _conn() as c:
+        # WAL: concurrent readers + a single writer without readers blocking —
+        # the right mode for many background loops sharing one SQLite file.
+        # Persisted in the DB header, so this runs once effectively.
+        c.execute("PRAGMA journal_mode=WAL")
         c.execute("""
             CREATE TABLE IF NOT EXISTS scan_subscribers (
                 user_id        INTEGER PRIMARY KEY,
