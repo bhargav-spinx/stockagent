@@ -3,6 +3,11 @@
 .env.*
 !env.example.txt
 
+# Telethon USER-ACCOUNT session — this IS a credential (account access). Never commit.
+telethon_session.session
+*.session
+*.session-journal
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,6 +27,11 @@ logs/
 # Runtime SQLite (subscribers, fired-signal dedup) — per-deployment state
 stockagent.db
 *.db-journal
+*.db-wal
+*.db-shm
+
+# Point-in-time universe snapshots (per-deployment runtime data)
+universe_snapshots/
 
 # IDE / OS
 .claude/

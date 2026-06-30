@@ -277,6 +277,7 @@ class TelethonListener:
         if APPLY_UNIVERSAL_FILTERS:
             from data_provider import fetch_data
             from scanner_filters import apply_universal_filters
+            from analyzer import drop_forming_candle
 
             filt_reason = ""
             filt_ok = False
@@ -284,6 +285,9 @@ class TelethonListener:
                 df = await asyncio.to_thread(
                     fetch_data, normalize_symbol(sym), "5d", "5m"
                 )
+                # Repaint guard: §5 filters read the last candle, so drop the
+                # still-forming one (consistent with analyze/scan_one/score_one).
+                df = drop_forming_candle(df, "5m")
                 if len(df) < 30:
                     filt_reason = f"insufficient 5m data ({len(df)} candles)"
                 else:

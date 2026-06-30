@@ -1586,10 +1586,15 @@ async def _eod_report_tick(app: Application) -> None:
     rejection_snapshot = dict(_today_rejections)
     for uid in subs:
         try:
-            report = await asyncio.to_thread(
-                eod_report.build_report, uid, None, rejection_snapshot
-            )
+            # build_report resolves pending alerts (fetches) — bound it so a hung
+            # feed can't stall the EOD loop.
+            report = await asyncio.wait_for(
+                asyncio.to_thread(
+                    eod_report.build_report, uid, None, rejection_snapshot),
+                timeout=600)
             await app.bot.send_message(uid, report, parse_mode="Markdown")
+        except asyncio.TimeoutError:
+            logger.error("EOD report for %s timed out (600s) — data feed slow", uid)
         except Exception as e:
             logger.warning("EOD report send to %s failed: %s", uid, e)
 
@@ -1635,8 +1640,13 @@ async def _swing_outcome_tick(app: Application) -> None:
     subscriptions.mark_fired(key)
 
     # Resolve every open alert (idempotent); we only notify on swing completions.
+    # Hard timeout so a hung feed during resolution can't stall this daily loop.
     try:
-        await asyncio.to_thread(eod_report.resolve_pending)
+        await asyncio.wait_for(
+            asyncio.to_thread(eod_report.resolve_pending), timeout=600)
+    except asyncio.TimeoutError:
+        logger.error("swing outcome: resolve_pending timed out (600s) — "
+                     "data feed slow; will retry next run")
     except Exception as e:
         logger.exception("swing outcome: resolve_pending failed: %s", e)
         # Still try to push any already-resolved-but-unnotified trades below.
