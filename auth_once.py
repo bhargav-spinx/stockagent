@@ -16,10 +16,15 @@ Usage:
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Same absolute session path the listener loads (telethon_listener.SESSION_NAME),
+# so re-authing here always writes the file the bot reads — regardless of CWD.
+SESSION_NAME = str(Path(__file__).resolve().parent / "telethon_session")
 
 
 async def main() -> None:
@@ -41,7 +46,8 @@ async def main() -> None:
     from telethon import TelegramClient
 
     print(f"Connecting as {phone}…")
-    client = TelegramClient("telethon_session", int(api_id), api_hash)
+    print(f"Session file: {SESSION_NAME}.session")
+    client = TelegramClient(SESSION_NAME, int(api_id), api_hash)
 
     await client.start(phone=phone)
 
