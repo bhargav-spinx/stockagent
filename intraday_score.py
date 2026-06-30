@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from constants import DISCLAIMER
+from constants import DISCLAIMER, trade_type_tag
 from scanner_indicators import (
     vwap, ema, supertrend,
     localize_ist, split_sessions, orb_levels, volume_ratio, trade_levels,
@@ -394,11 +394,13 @@ def format_scorecard(c: ScoreCard) -> str:
              "Watchlist": "🟡", "Avoid": "⚪️"}.get(c.rating, "⚪️")
 
     if c.direction == "none":
-        return (f"{emoji} *{c.symbol}*  ·  ₹{c.price:,.2f}\n"
+        return (f"{trade_type_tag('intraday')}\n"
+                f"{emoji} *{c.symbol}*  ·  ₹{c.price:,.2f}\n"
                 f"*Score: {c.score}/100 — {c.rating}*\n"
                 + ("\n".join(f"_{n}_" for n in c.notes) if c.notes else ""))
 
     lines = [
+        trade_type_tag("intraday"),
         f"{emoji} *{c.symbol}*  ·  ₹{c.price:,.2f}",
         f"*Score: {c.score}/100 — {c.rating}*",
         "",

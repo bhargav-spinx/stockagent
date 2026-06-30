@@ -27,7 +27,7 @@ from typing import Optional
 
 from telegram.ext import Application
 
-from constants import IST, SWING_MIN_CONFIDENCE
+from constants import IST, SWING_MIN_CONFIDENCE, trade_type_tag
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +344,8 @@ class TelethonListener:
         """
         arrow = "🟢" if tip["action"] == "BUY" else "🔴"
         lines = [
+            # Channel tips are evaluated on the daily/swing horizon.
+            trade_type_tag("swing"),
             f"📡 *Channel tip from @{channel}*\n",
             f"{arrow} *{tip['symbol']}*  ·  *{tip['action']}*",
         ]

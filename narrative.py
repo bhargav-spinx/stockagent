@@ -17,7 +17,7 @@ FACT  = a value read from the engine.   INTERPRETATION = a rule-based read of it
 """
 from __future__ import annotations
 
-from constants import DISCLAIMER
+from constants import DISCLAIMER, trade_type_tag
 
 # --- §8 Conviction buckets (strength of confluence, NOT probability) ----------
 def conviction_bucket(strength: float | None, gate_passed: bool = True) -> str:
@@ -89,7 +89,8 @@ def narrate_scorecard(card) -> str:
     if card.direction == "none":
         passed, failed, _ = evaluate_gates_intraday(card)
         return (
-            f"📑 *{card.symbol}* · ₹{card.price:,.2f} · intraday _(last closed candle)_\n\n"
+            f"{trade_type_tag('intraday')}\n"
+            f"📑 *{card.symbol}* · ₹{card.price:,.2f} · _(last closed candle)_\n\n"
             f"*Verdict: NO-TRADE* — {', '.join(failed) or 'no directional thesis'}\n"
             + ("\n".join(f"_{n}_" for n in card.notes) if card.notes else "")
             + f"\n\n{DISCLAIMER}"
@@ -101,7 +102,8 @@ def narrate_scorecard(card) -> str:
     carry, drag = _carry_drag(card.breakdown)
 
     lines = [
-        f"📑 *{card.symbol}* · ₹{card.price:,.2f} · intraday _(last closed candle)_",
+        trade_type_tag("intraday"),
+        f"📑 *{card.symbol}* · ₹{card.price:,.2f} · _(last closed candle)_",
         "",
         "*FACT (engine-computed)*",
         f"• Score *{card.score}/100* — {card.rating}; direction *{bias}*",
@@ -168,7 +170,8 @@ def narrate_swing(result: dict) -> str:
     disagree = [f"{name} ({s})" for name, s, _ in votes if s not in (sig, "HOLD")]
 
     lines = [
-        f"📑 *{sym}* · ₹{result['price']:,.2f} · swing _(daily, last closed candle)_",
+        trade_type_tag("swing"),
+        f"📑 *{sym}* · ₹{result['price']:,.2f} · _(daily, last closed candle)_",
         "",
         "*FACT (engine-computed)*",
         f"• Vote signal: *{sig}*  ({conf}% of indicators agree)" if conf is not None

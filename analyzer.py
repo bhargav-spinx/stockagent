@@ -8,7 +8,7 @@ import numpy as np
 from datetime import datetime, time, timedelta
 
 from data_provider import fetch_data, get_provider_name
-from constants import IST
+from constants import IST, trade_type_tag
 
 
 # Per-mode indicator config. Swing = daily candles, slow indicators.
@@ -417,6 +417,7 @@ def format_report(result: dict) -> str:
     arrow = "📈" if result["change_pct"] >= 0 else "📉"
 
     lines = [
+        trade_type_tag(result.get("mode", "")),
         f"*{result['symbol']}*  _({result.get('mode_label', '')})_",
         f"💰 ₹{result['price']}  {arrow} {result['change_pct']:+.2f}% _{result.get('change_label', '')}_",
         "",
