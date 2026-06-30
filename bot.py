@@ -46,6 +46,7 @@ from scanner import (
     score_one, score_many,
 )
 import intraday_score
+import narrative
 from scanner_filters import is_intraday_entry_window
 import universe
 from universe import INTRADAY_UNIVERSE, SWING_UNIVERSE
@@ -429,6 +430,45 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await update.message.reply_text(card_msg, parse_mode="Markdown")
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/report SYMBOL [swing] — deterministic institutional narrative read.
+    Default: intraday (100-pt score). Add 'swing' for the daily-vote read.
+    No LLM/API — templated over the engine's computed fields."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/report RELIANCE` — institutional intraday read.\n"
+            "Swing read: `/report RELIANCE swing`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbol = context.args[0].upper()
+    mode = "swing" if (len(context.args) > 1 and
+                       context.args[1].lower().startswith("sw")) else "intraday"
+    await update.message.reply_text(f"📑 Building {mode} report for {symbol}…")
+    try:
+        if mode == "swing":
+            result = await asyncio.wait_for(
+                asyncio.to_thread(analyze, symbol, "swing"), timeout=45)
+            msg = narrative.narrate_swing(result)
+        else:
+            idx = await asyncio.wait_for(
+                asyncio.to_thread(intraday_score.index_trend), timeout=45)
+            r = await asyncio.wait_for(
+                asyncio.to_thread(score_one, symbol, idx), timeout=45)
+            if r["status"] != "scored":
+                await update.message.reply_text(
+                    f"❌ `{symbol}` — {r['reason']}", parse_mode="Markdown")
+                return
+            msg = narrative.narrate_scorecard(r["scorecard"])
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "⚠️ Report timed out — data feed slow. Try again shortly.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error building report: {e}")
 
 
 async def mywatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1704,6 +1744,7 @@ COMMAND_MENU = [
     # Scanner
     BotCommand("scan", "Scan tier-1 watchlist for setups"),
     BotCommand("score", "100-point intraday scorecard  (e.g. /score TCS)"),
+    BotCommand("report", "Institutional read — gates + plan  (e.g. /report TCS)"),
     BotCommand("scan_alerts", "Auto-scan during NSE hours (on/off)"),
     # Swing
     BotCommand("swing_alerts", "End-of-day BUY/SELL alerts (on/off)"),
@@ -1896,6 +1937,7 @@ def main():
     # Scanner
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("score", score_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("scan_alerts", scan_alerts_cmd))
 
     # Swing alerts
