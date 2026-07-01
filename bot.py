@@ -705,17 +705,31 @@ AUTOSCAN_FIRST_DELAY_SEC = 30  # wait this long after bot start before first run
 _today_rejections: dict[str, int] = {}
 _today_signals_fired: int = 0
 _today_stats_date: 'date | None' = None
+# Feed-health counters (reset daily). These let the 13:00 digest tell
+# "quiet market" apart from "scans ran but every candle fetch failed".
+_today_scans_completed: int = 0   # ticks where score_many returned results
+_today_scored_ok: int = 0          # symbol-results with status == "scored"
+_today_fetch_errors: int = 0       # symbol-results with status == "error"
+_today_scan_timeouts: int = 0      # ticks where score_many timed out
+_last_fetch_error: str = ""        # most recent fetch error reason (for digest)
 
 
 def _reset_daily_stats_if_new_day() -> None:
     """Reset rejection/signal counters on day change."""
     global _today_stats_date, _today_signals_fired
+    global _today_scans_completed, _today_scored_ok, _today_fetch_errors
+    global _today_scan_timeouts, _last_fetch_error
     from datetime import date as _date
     today_d = _date.today()
     if _today_stats_date != today_d:
         _today_stats_date = today_d
         _today_signals_fired = 0
         _today_rejections.clear()
+        _today_scans_completed = 0
+        _today_scored_ok = 0
+        _today_fetch_errors = 0
+        _today_scan_timeouts = 0
+        _last_fetch_error = ""
 
 
 def _bump_rejection(reason: str) -> None:
@@ -776,6 +790,8 @@ SWING_SYMBOL_TIMEOUT_SEC = 30
 async def _autoscan_tick(app: Application) -> None:
     """One pass of the auto-scan loop. Safe to call any time; no-ops outside market hours."""
     _reset_daily_stats_if_new_day()
+    global _today_scans_completed, _today_scored_ok, _today_fetch_errors
+    global _today_scan_timeouts, _last_fetch_error
 
     if not is_intraday_entry_window():
         return
@@ -800,6 +816,7 @@ async def _autoscan_tick(app: Application) -> None:
             asyncio.to_thread(score_many, INTRADAY_UNIVERSE, idx),
             timeout=AUTOSCAN_SCAN_TIMEOUT_SEC)
     except asyncio.TimeoutError:
+        _today_scan_timeouts += 1
         logger.error("autoscan: score_many timed out after %ss — skipping this tick "
                      "(data feed slow/hung)", AUTOSCAN_SCAN_TIMEOUT_SEC)
         return
@@ -807,9 +824,15 @@ async def _autoscan_tick(app: Application) -> None:
         logger.exception("autoscan: score_many crashed: %s", e)
         return
 
-    # Aggregate non-qualifying outcomes for the quiet-day digest
+    _today_scans_completed += 1
+
+    # Aggregate outcomes for the quiet-day digest AND track feed health.
+    scored_this_tick = 0
+    errored_this_tick = 0
     for r in results:
         if r["status"] == "scored":
+            scored_this_tick += 1
+            _today_scored_ok += 1
             c = r["scorecard"]
             if c.score < AUTOSCAN_MIN_SCORE:
                 _bump_rejection(f"{c.rating} (score {c.score})")
@@ -817,6 +840,18 @@ async def _autoscan_tick(app: Application) -> None:
                 _bump_rejection("Counter-trend (suppressed by market regime)")
             elif not c.event_ok:
                 _bump_rejection("Earnings within 2 days (event risk suppressed)")
+        elif r["status"] == "error":
+            errored_this_tick += 1
+            _today_fetch_errors += 1
+            _last_fetch_error = r.get("reason", "unknown")
+
+    # If every symbol errored, the candle feed is broken — surface it loudly
+    # instead of silently swallowing errors (which used to look like a quiet
+    # market). The session can be "active" while getCandleData still fails.
+    if results and scored_this_tick == 0 and errored_this_tick:
+        logger.error(
+            "autoscan: ALL %d symbols errored this tick, 0 scored — candle feed "
+            "broken. Last error: %s", errored_this_tick, _last_fetch_error)
 
     # Fire only the very strongest setups (≥90) that are WITH the market regime
     # (#4) and clear of imminent earnings (event risk), top 5 per pass.
@@ -885,11 +920,41 @@ QUIET_DIGEST_WINDOW = (dt_time(13, 0), dt_time(13, 15))
 def _format_quiet_digest() -> str:
     """Format the 'market quiet so far' message based on today's stats."""
     total_rejections = sum(_today_rejections.values())
-    if total_rejections == 0:
+
+    # State A — scans ran but EVERY fetch failed: a feed outage, not a quiet
+    # market. Say so, with the actual error, instead of the old vague text.
+    if _today_scans_completed > 0 and _today_scored_ok == 0 and _today_fetch_errors > 0:
+        return (
+            "⚠️ *Feed problem — 13:00 IST*\n\n"
+            f"Ran *{_today_scans_completed}* scan cycle(s) since 09:30, but "
+            f"*every data fetch failed* ({_today_fetch_errors} errors, 0 scored). "
+            "The market isn't quiet — the candle feed is broken.\n\n"
+            f"Last error: `{_last_fetch_error}`\n\n"
+            "_`/angel_status` only confirms login, not candle data. Check Angel "
+            "rate limits, the scrip master, or historical-API access._"
+        )
+
+    # State B — no cycle ever completed: loop stalled or every cycle timed out.
+    if _today_scans_completed == 0:
+        if _today_scan_timeouts > 0:
+            return (
+                "⚠️ *Feed problem — 13:00 IST*\n\n"
+                f"Every scan cycle timed out ({_today_scan_timeouts} so far) — "
+                "the data feed is slow or hung, so nothing has scored.\n\n"
+                "_`/angel_status` only confirms login, not candle data._"
+            )
         return (
             "🌤 *Market check — 13:00 IST*\n\n"
-            "I haven't completed any scan cycles yet today. "
-            "If you're expecting alerts, send `/angel_status` to verify the data source is alive."
+            "No scan cycles have run yet today. If you're expecting alerts, the "
+            "scan loop may be stalled — verify the bot is up and inside NSE "
+            "hours (09:30–14:30 IST), then send `/angel_status`."
+        )
+
+    # State C — cycles ran, data was fine, nothing qualified: genuinely quiet.
+    if total_rejections == 0:
+        return (
+            "🌤 *Market quiet so far — 13:00 IST*\n\n"
+            f"Ran *{_today_scans_completed}* scan cycle(s); no setups met the bar."
         )
 
     top = sorted(_today_rejections.items(), key=lambda x: -x[1])[:5]

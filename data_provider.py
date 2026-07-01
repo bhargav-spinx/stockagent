@@ -109,6 +109,64 @@ def angel_session_active() -> bool:
     return _angel_session is not None
 
 
+# Angel throttles the historical/candle API hard (per-second + daily caps).
+# A rate-limited call comes back as status:false with an "exceeding access
+# rate" message rather than raising — the old code re-authed only on
+# exceptions, so throttled responses failed instantly and every symbol in a
+# scan tick errored at once. Retry rate-limited responses with backoff.
+CANDLE_MAX_RETRIES = 3
+CANDLE_BACKOFF_BASE_SEC = 1.0
+_RATE_LIMIT_MARKERS = ("access rate", "rate limit", "too many requests")
+
+
+def _is_rate_limited(resp: dict) -> bool:
+    msg = str(resp.get("message", "")).lower()
+    code = str(resp.get("errorcode", "")).lower()
+    return any(m in msg for m in _RATE_LIMIT_MARKERS) or code == "ab1004"
+
+
+def _get_candle_data(params: dict, label: str) -> dict:
+    """Fetch candles with re-auth-on-exception and backoff-on-rate-limit.
+
+    Returns the raw Angel response (status truthy, data present) or raises
+    ValueError with the provider's message. Rate-limited responses are retried
+    with exponential backoff; a stale session is re-authed once per attempt.
+    """
+    last_msg = ""
+    for attempt in range(CANDLE_MAX_RETRIES):
+        try:
+            resp = _get_angel_session().getCandleData(params)
+        except Exception as e:
+            # Session may have expired — re-auth once and retry this attempt.
+            logger.warning("Angel call failed for %s (%s); re-authenticating",
+                           label, e)
+            _reset_angel_session()
+            try:
+                resp = _get_angel_session().getCandleData(params)
+            except Exception as e2:
+                last_msg = str(e2)
+                if attempt < CANDLE_MAX_RETRIES - 1:
+                    time.sleep(CANDLE_BACKOFF_BASE_SEC * (2 ** attempt))
+                    continue
+                raise ValueError(f"No Angel data for {label}: {last_msg}")
+
+        if resp.get("status") and resp.get("data"):
+            return resp
+
+        last_msg = str(resp.get("message"))
+        if _is_rate_limited(resp) and attempt < CANDLE_MAX_RETRIES - 1:
+            wait = CANDLE_BACKOFF_BASE_SEC * (2 ** attempt)
+            logger.warning("Angel rate-limited on %s (%s) — backing off %.1fs "
+                           "(attempt %d/%d)", label, last_msg, wait,
+                           attempt + 1, CANDLE_MAX_RETRIES)
+            time.sleep(wait)
+            continue
+        # Non-retryable (bad symbol, no data, permission) — stop retrying.
+        break
+
+    raise ValueError(f"No Angel data for {label}: {last_msg}")
+
+
 def _load_scrip_master():
     """Load Angel's symbol→token map. Cached on disk; refreshed once per day."""
     global _scrip_master
@@ -169,19 +227,7 @@ def _fetch_angel_by_token(exchange: str, token: str, period: str, interval: str,
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
-    def call():
-        smart = _get_angel_session()
-        return smart.getCandleData(params)
-
-    try:
-        resp = call()
-    except Exception as e:
-        logger.warning("Angel index call failed (%s); re-authenticating", e)
-        _reset_angel_session()
-        resp = call()
-
-    if not resp.get("status") or not resp.get("data"):
-        raise ValueError(f"No Angel data for {label}: {resp.get('message')}")
+    resp = _get_candle_data(params, label)
 
     df = pd.DataFrame(resp["data"],
                       columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
@@ -225,20 +271,7 @@ def fetch_angel(symbol: str, period: str, interval: str) -> pd.DataFrame:
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
-    def call():
-        smart = _get_angel_session()
-        return smart.getCandleData(params)
-
-    try:
-        resp = call()
-    except Exception as e:
-        # Session may have expired — retry once with fresh login
-        logger.warning("Angel call failed (%s); re-authenticating", e)
-        _reset_angel_session()
-        resp = call()
-
-    if not resp.get("status") or not resp.get("data"):
-        raise ValueError(f"No Angel data for {symbol}: {resp.get('message')}")
+    resp = _get_candle_data(params, symbol)
 
     df = pd.DataFrame(resp["data"],
                       columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
