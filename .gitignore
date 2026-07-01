@@ -29,6 +29,8 @@ stockagent.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.db.bak-*
+*.db.bak
 
 # Point-in-time universe snapshots (per-deployment runtime data)
 universe_snapshots/
