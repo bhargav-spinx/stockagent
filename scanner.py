@@ -113,12 +113,27 @@ def score_one(symbol: str, idx_trend: dict | None = None) -> dict:
 SCAN_PACING_SEC = 0.5
 
 
-def _paced_map(fn, symbols: Iterable[str], pacing_sec: float) -> list[dict]:
+def _paced_map(fn, symbols: Iterable[str], pacing_sec: float,
+               deadline_sec: float | None = None) -> list[dict]:
     """Apply `fn` to each symbol sequentially, sleeping `pacing_sec` between
-    calls to respect Angel's rate limit. Shared by scan_many / score_many."""
+    calls to respect Angel's rate limit. Shared by scan_many / score_many.
+
+    `deadline_sec` is a hard wall-clock budget: once exceeded, the remaining
+    symbols are skipped (logged) and partial results returned. Without it, a
+    slow feed makes the scan overrun the caller's asyncio timeout — the caller
+    gives up but this worker THREAD keeps running (threads can't be cancelled),
+    so the next tick starts a second scan on top of it: doubled request rate,
+    more throttling, and a self-inflicted feed death-spiral."""
     results = []
     syms = list(symbols)
+    start = time.monotonic()
     for i, sym in enumerate(syms):
+        if deadline_sec is not None and time.monotonic() - start > deadline_sec:
+            logger.warning(
+                "scan budget %.0fs exhausted at %d/%d symbols — remainder "
+                "skipped this pass (feed slow or throttled)",
+                deadline_sec, i, len(syms))
+            break
         results.append(fn(sym))
         if pacing_sec > 0 and i < len(syms) - 1:
             time.sleep(pacing_sec)
@@ -126,15 +141,19 @@ def _paced_map(fn, symbols: Iterable[str], pacing_sec: float) -> list[dict]:
 
 
 def score_many(symbols: Iterable[str], idx_trend: dict | None = None,
-               pacing_sec: float = SCAN_PACING_SEC) -> list[dict]:
+               pacing_sec: float = SCAN_PACING_SEC,
+               deadline_sec: float | None = None) -> list[dict]:
     """Score symbols sequentially, pacing between Angel calls."""
-    return _paced_map(lambda s: score_one(s, idx_trend=idx_trend), symbols, pacing_sec)
+    return _paced_map(lambda s: score_one(s, idx_trend=idx_trend), symbols,
+                      pacing_sec, deadline_sec=deadline_sec)
 
 
 def scan_many(symbols: Iterable[str], check_time: bool = True,
-              pacing_sec: float = SCAN_PACING_SEC) -> list[dict]:
+              pacing_sec: float = SCAN_PACING_SEC,
+              deadline_sec: float | None = None) -> list[dict]:
     """Scan symbols sequentially, sleeping briefly between calls to respect Angel rate limits."""
-    return _paced_map(lambda s: scan_one(s, check_time=check_time), symbols, pacing_sec)
+    return _paced_map(lambda s: scan_one(s, check_time=check_time), symbols,
+                      pacing_sec, deadline_sec=deadline_sec)
 
 
 def format_signal(sig: Signal) -> str:

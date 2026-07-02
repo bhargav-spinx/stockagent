@@ -157,7 +157,12 @@ def save_universe_snapshot(symbols: list[str],
     backtests can reconstruct point-in-time membership. (Historical membership
     before the first snapshot must be sourced manually from NSE archives — it
     cannot be recovered from a current list.)"""
-    as_of = as_of or date.today()
+    if as_of is None:
+        # IST trade date, not the server's UTC date — a UTC-evening run would
+        # otherwise stamp the snapshot with the previous trading day.
+        from constants import IST
+        from datetime import datetime
+        as_of = datetime.now(IST).date()
     SNAPSHOT_DIR.mkdir(exist_ok=True)
     path = SNAPSHOT_DIR / f"{as_of.isoformat()}.json"
     path.write_text(json.dumps(sorted(set(symbols)), indent=0), encoding="utf-8")

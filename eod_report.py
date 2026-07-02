@@ -111,8 +111,15 @@ def resolve_intraday(alert: dict[str, Any],
     elif str(df.index.tz) != str(IST):
         df = df.tz_convert(IST)
 
-    # Only candles after the trigger candle (which already closed at entry)
-    post = df[df.index > gen_time]
+    # Evaluate from the candle that was FORMING at alert time (index floored
+    # to the 5-min grid). `index > gen_time` would skip it entirely — up to
+    # 5 minutes of post-entry SL/T1 action invisible to the resolver. The
+    # trigger candle (one grid slot earlier) stays excluded. Slightly
+    # optimistic on fills within that first candle — consistent with the
+    # module-level fill assumptions.
+    candle_start = gen_time.replace(second=0, microsecond=0)
+    candle_start -= timedelta(minutes=candle_start.minute % 5)
+    post = df[df.index >= candle_start]
     # Restrict to today's session
     post = post[post.index.date == gen_time.date()]
     if len(post) == 0:
@@ -122,16 +129,6 @@ def resolve_intraday(alert: dict[str, Any],
     t1_hit_time = None
 
     for ts, row in post.iterrows():
-        # Time-stop check: 45 min after generation
-        if not t1_hit and (ts - gen_time) > timedelta(minutes=45):
-            close = float(row["Close"])
-            return {
-                "status": "time_stop",
-                "exit_price": close,
-                "exit_time": ts,
-                "pnl_pct": round(_signed_pct(entry, close, direction), 2),
-            }
-
         if direction == "long":
             sl_in = row["Low"] <= sl
             t1_in = row["High"] >= t1
@@ -149,6 +146,18 @@ def resolve_intraday(alert: dict[str, Any],
                     "exit_price": sl,
                     "exit_time": ts,
                     "pnl_pct": round(_signed_pct(entry, sl, direction), 2),
+                }
+            # Time-stop: 45 min elapsed with neither SL nor T1. Checked AFTER
+            # SL (a stop breach inside the boundary candle must count as a
+            # stop, not a time-stop exit at that candle's close) and BEFORE
+            # T1 grants continuation.
+            if not t1_in and (ts - gen_time) > timedelta(minutes=45):
+                close = float(row["Close"])
+                return {
+                    "status": "time_stop",
+                    "exit_price": close,
+                    "exit_time": ts,
+                    "pnl_pct": round(_signed_pct(entry, close, direction), 2),
                 }
             if t1_in:
                 t1_hit = True
@@ -294,7 +303,12 @@ def resolve_pending(max_age_days: int = 30) -> int:
     resolved = 0
     for alert in open_alerts:
         outcome = resolve_alert(alert)
-        if outcome is None or outcome.get("status") == "open":
+        # "no_data" is a TRANSIENT fetch failure, not a trade outcome. Never
+        # persist it: a saved outcome row permanently removes the alert from
+        # get_open_alerts, so one rate-limited fetch would silently erase a
+        # real win/loss from /stats forever. Leave it open — the next resolver
+        # run retries; truly dead symbols age out via max_age_days.
+        if outcome is None or outcome.get("status") in ("open", "no_data"):
             continue
         subscriptions.save_outcome(
             alert["id"],
@@ -395,7 +409,8 @@ def build_report(user_id: int | None = None,
     if resolved_now:
         logger.info("EOD: resolved %d pending alerts", resolved_now)
 
-    trade_date_str = trade_date_str or date.today().isoformat()
+    # IST trade date, not the server's UTC date (see subscriptions._ist_today).
+    trade_date_str = trade_date_str or datetime.now(IST).date().isoformat()
     all_today = subscriptions.get_alerts_for_date(trade_date_str, user_id=user_id)
 
     scan_rows = [r for r in all_today if r["category"] == "scan"]

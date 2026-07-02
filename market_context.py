@@ -182,6 +182,18 @@ def days_to_earnings(symbol: str) -> int | None:
     return (ed - datetime.now(IST).date()).days
 
 
+def earnings_data_available() -> bool:
+    """Whether today's NSE results calendar actually loaded. Lets callers
+    distinguish 'no earnings scheduled for this symbol' (calendar loaded,
+    symbol absent → genuinely clear) from 'calendar fetch failed' (event risk
+    UNKNOWN — the gate is silently fail-open and the caller should say so)."""
+    today = _today_str()
+    if _earnings_cache["date"] != today:
+        _earnings_cache["data"] = _load_earnings()
+        _earnings_cache["date"] = today
+    return bool(_earnings_cache["data"])
+
+
 # ----------------------------------------------------------------------------
 # Live news — Marketaux (per-symbol, rate-limited, key required)
 # ----------------------------------------------------------------------------

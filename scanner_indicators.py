@@ -153,18 +153,35 @@ def orb_levels(today_df: pd.DataFrame, n_candles: int) -> tuple[float, float]:
 
 def volume_ratio(df: pd.DataFrame) -> float | None:
     """Last candle volume ÷ average of the prior 12 candles.
-    Returns None when there is no usable baseline (<13 candles or zero avg)."""
+    Returns None when there is no usable baseline (<13 candles or zero avg).
+
+    When today's session already has 13+ candles, the baseline is restricted
+    to TODAY only: a cross-session window in the first hour would compare the
+    morning candle against yesterday's late-afternoon volumes (elevated by the
+    close), skewing the ratio. Early in the session (<13 candles today) the
+    cross-session window is kept as a documented compromise — no same-day
+    baseline exists yet."""
     if len(df) < 13:
         return None
-    cur = float(df["Volume"].iloc[-1])
-    avg = float(df["Volume"].iloc[-13:-1].mean())
+    today = today_session(df)
+    base = today if len(today) >= 13 else df
+    cur = float(base["Volume"].iloc[-1])
+    avg = float(base["Volume"].iloc[-13:-1].mean())
     return cur / avg if avg > 0 else None
 
 
 def trade_levels(entry: float, direction: str, df: pd.DataFrame,
                  atr_mult: float = ATR_SL_MULT, atr_period: int = ATR_PERIOD,
                  rr1: float = RR_T1, rr2: float = RR_T2):
-    """Canonical (stop_loss, target1, target2) for an entry.
+    """Canonical INTRADAY (stop_loss, target1, target2) for an entry.
+
+    NOTE: this is one of TWO deliberate risk models in the project — do not
+    unify them casually:
+      • INTRADAY (here): stop = 1.5×ATR(14) on 5-min; targets at 2R / 3R.
+      • SWING (analyzer.build_trade_setup): stop = tighter of 1.5×ATR(daily)
+        vs 0.5% beyond the 20-day swing extreme; targets at 1.5R / 3R.
+    Different horizons price risk differently; each model is the single source
+    of truth for its horizon.
 
     Stop distance (`risk`) = atr_mult × ATR(atr_period), so it adapts to each
     stock's volatility; targets are locked to R:R multiples of that risk

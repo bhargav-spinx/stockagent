@@ -157,7 +157,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scan SYMBOL — scan one or more symbols\n"
         "`/scan_alerts on` — intraday auto-scan every 5 min, ping on setups\n"
         "`/swing_alerts on` — end-of-day BUY/SELL alerts (15:45 IST, your watchlist)\n"
-        "`/eod_report on` — daily summary of alerts + outcomes (15:35 IST)\n"
+        "`/eod_report on` — daily summary of alerts + outcomes (16:20 IST)\n"
         "/today — on-demand EOD report right now\n"
         "/index — NIFTY / Bank NIFTY / SENSEX snapshot\n"
         "/universe — show stocks scanned by alerts\n"
@@ -177,11 +177,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome, parse_mode="Markdown")
 
 
+# Bound for any single analyze() call from a handler. Keeps a slow feed from
+# hanging a command forever; the fetch itself runs in a worker thread so the
+# event loop (and all background loops) stay responsive either way.
+ANALYZE_TIMEOUT_SEC = 60
+
+
+async def _analyze_async(symbol: str, mode: str = "swing") -> dict:
+    """analyze() off the event loop with a hard timeout. All async handlers
+    MUST use this instead of calling analyze() directly — a sync call blocks
+    the entire bot (every loop, every user) for the duration of the fetch."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(analyze, symbol, mode), timeout=ANALYZE_TIMEOUT_SEC)
+
+
 async def _full_analysis(update: Update, symbol: str, mode: str):
     label = "Intraday" if mode == "intraday" else "Swing"
     await update.message.reply_text(f"🔍 {label} analysis: {symbol.upper()}...")
     try:
-        result = analyze(symbol, mode=mode)
+        result = await _analyze_async(symbol, mode)
         report = format_report(result)
         keyboard = [[
             InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mode}:{symbol}"),
@@ -207,6 +221,9 @@ async def _full_analysis(update: Update, symbol: str, mode: str):
                     target1=ts["target1"],
                     target2=ts["target2"],
                 )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            f"⚠️ {label} analysis timed out — data feed slow. Try again shortly.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -230,7 +247,7 @@ async def intraday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _quick(update: Update, symbol: str, mode: str):
     try:
-        r = analyze(symbol, mode=mode)
+        r = await _analyze_async(symbol, mode)
         emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}[r["signal"]]
         tag = "INTRA" if mode == "intraday" else "SWING"
         msg = (
@@ -482,7 +499,7 @@ async def mywatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📋 Analyzing {len(watchlist)} stock(s)...")
     for symbol in watchlist:
         try:
-            r = analyze(symbol)
+            r = await _analyze_async(symbol)
             emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}[r["signal"]]
             msg = (
                 f"{emoji} *{r['symbol']}* → *{r['signal']}*\n"
@@ -506,7 +523,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # callback_data format: refresh:<mode>:<symbol>
         mode, symbol = parts[1], parts[2]
         try:
-            result = analyze(symbol, mode=mode)
+            result = await _analyze_async(symbol, mode)
             report = format_report(result)
             keyboard = [[
                 InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mode}:{symbol}"),
@@ -664,8 +681,12 @@ async def tip_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await msg.reply_text(_format_tip_summary(tip), parse_mode="Markdown")
 
     if ocr_text and len(ocr_text) < 400:
+        # OCR output is untrusted input going inside a Markdown code fence —
+        # strip backticks so a crafted image can't break out of the block
+        # (worst case was a parse error that killed the reply).
+        safe_ocr = ocr_text.replace("`", "'")
         await msg.reply_text(
-            f"_OCR text read:_\n```\n{ocr_text}\n```",
+            f"_OCR text read:_\n```\n{safe_ocr}\n```",
             parse_mode="Markdown",
         )
 
@@ -687,9 +708,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        r = analyze(symbol)
+        r = await _analyze_async(symbol)
         report = format_report(r)
         await update.message.reply_text(report, parse_mode="Markdown")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⚠️ Analysis timed out — data feed slow.")
     except Exception as e:
         await update.message.reply_text(f"❌ {e}\n\nTry /help for commands.")
 
@@ -715,12 +738,11 @@ _last_fetch_error: str = ""        # most recent fetch error reason (for digest)
 
 
 def _reset_daily_stats_if_new_day() -> None:
-    """Reset rejection/signal counters on day change."""
+    """Reset rejection/signal counters on IST day change (server clock is UTC)."""
     global _today_stats_date, _today_signals_fired
     global _today_scans_completed, _today_scored_ok, _today_fetch_errors
     global _today_scan_timeouts, _last_fetch_error
-    from datetime import date as _date
-    today_d = _date.today()
+    today_d = datetime.now(IST).date()
     if _today_stats_date != today_d:
         _today_stats_date = today_d
         _today_signals_fired = 0
@@ -784,7 +806,21 @@ AUTOSCAN_MAX_DAILY = 8     # risk cap: stop firing once this many fired today
 # (Python can't cancel threads) but the loop stays responsive.
 INDEX_TREND_TIMEOUT_SEC = 60
 AUTOSCAN_SCAN_TIMEOUT_SEC = 280       # < AUTOSCAN_INTERVAL_SEC (300)
+# In-worker wall-clock budget for one scoring pass. MUST be comfortably below
+# AUTOSCAN_SCAN_TIMEOUT_SEC: the asyncio timeout can only abandon the worker
+# thread (threads aren't cancellable), while this budget makes the thread
+# actually STOP — preventing abandoned scans from stacking up and doubling the
+# Angel request rate (the rate-limit death-spiral).
+AUTOSCAN_SCAN_BUDGET_SEC = 240
 SWING_SYMBOL_TIMEOUT_SEC = 30
+
+# Overlap guard: handle to the in-flight scoring pass. A timed-out pass leaves
+# its worker thread running (threads aren't cancellable), so the next tick must
+# check task.done() — not a flag — to know whether it's truly finished.
+_scan_task: "asyncio.Task | None" = None
+# Rotation offset: when a pass is budget-truncated, start the next pass where
+# this one stopped so tail symbols aren't permanently starved.
+_scan_offset = 0
 
 
 async def _autoscan_tick(app: Application) -> None:
@@ -792,6 +828,7 @@ async def _autoscan_tick(app: Application) -> None:
     _reset_daily_stats_if_new_day()
     global _today_scans_completed, _today_scored_ok, _today_fetch_errors
     global _today_scan_timeouts, _last_fetch_error
+    global _scan_task, _scan_offset
 
     if not is_intraday_entry_window():
         return
@@ -800,8 +837,21 @@ async def _autoscan_tick(app: Application) -> None:
     if not subs:
         return
 
-    logger.info("autoscan: scoring %d symbols for %d subscriber(s)",
-                len(INTRADAY_UNIVERSE), len(subs))
+    # Overlap guard: if the previous pass's worker thread is still alive
+    # (asyncio timeout can't kill threads), do NOT start another scan on top
+    # of it — stacked scans double the request rate and feed the very
+    # rate-limiting that made the first pass slow.
+    if _scan_task is not None and not _scan_task.done():
+        logger.error("autoscan: previous scan still running — skipping this "
+                     "tick (feed too slow for %d symbols?)", len(INTRADAY_UNIVERSE))
+        return
+
+    # Rotate the universe so a budget-truncated pass resumes where it stopped.
+    universe_rot = (list(INTRADAY_UNIVERSE[_scan_offset:])
+                    + list(INTRADAY_UNIVERSE[:_scan_offset]))
+
+    logger.info("autoscan: scoring %d symbols for %d subscriber(s) (offset %d)",
+                len(universe_rot), len(subs), _scan_offset)
     # Market-index trend fetched once; shared across all symbols this pass.
     try:
         idx = await asyncio.wait_for(
@@ -811,18 +861,40 @@ async def _autoscan_tick(app: Application) -> None:
         logger.error("autoscan: index_trend timed out after %ss — using empty regime",
                      INDEX_TREND_TIMEOUT_SEC)
         idx = {}
+    if not idx:
+        # Explicit fail-open: with no index data the counter-trend gate can't
+        # gate anything this pass. Every fired card carries a matching note.
+        logger.warning("autoscan: index regime unavailable — regime gate "
+                       "INACTIVE this pass (fail-open)")
+    # shield(): on timeout, wait_for must NOT cancel the task wrapper — a
+    # "cancelled" wrapper reports done() while its thread still runs, which
+    # would defeat the overlap guard above.
+    _scan_task = asyncio.create_task(
+        asyncio.to_thread(score_many, universe_rot, idx,
+                          deadline_sec=AUTOSCAN_SCAN_BUDGET_SEC))
+    # Retrieve any exception from an abandoned (timed-out) pass so asyncio
+    # doesn't log "Task exception was never retrieved".
+    _scan_task.add_done_callback(
+        lambda t: t.cancelled() or (t.exception() and logger.error(
+            "autoscan: abandoned scan pass ended with error: %s", t.exception())))
     try:
         results = await asyncio.wait_for(
-            asyncio.to_thread(score_many, INTRADAY_UNIVERSE, idx),
-            timeout=AUTOSCAN_SCAN_TIMEOUT_SEC)
+            asyncio.shield(_scan_task), timeout=AUTOSCAN_SCAN_TIMEOUT_SEC)
     except asyncio.TimeoutError:
         _today_scan_timeouts += 1
-        logger.error("autoscan: score_many timed out after %ss — skipping this tick "
+        logger.error("autoscan: score_many timed out after %ss — skipping this tick; "
+                     "overlap guard holds further ticks until the worker exits "
                      "(data feed slow/hung)", AUTOSCAN_SCAN_TIMEOUT_SEC)
         return
     except Exception as e:
         logger.exception("autoscan: score_many crashed: %s", e)
         return
+
+    # Advance rotation: full pass → reset to 0; truncated pass → resume point.
+    if len(results) >= len(universe_rot):
+        _scan_offset = 0
+    else:
+        _scan_offset = (_scan_offset + len(results)) % len(INTRADAY_UNIVERSE)
 
     _today_scans_completed += 1
 
@@ -864,6 +936,21 @@ async def _autoscan_tick(app: Application) -> None:
     qualifying = qualifying[:AUTOSCAN_MAX_ALERTS]
 
     global _today_signals_fired
+    # Restart-safe daily cap: the in-memory counter dies with the process, so
+    # a mid-session systemd restart would otherwise reset the risk cap and
+    # allow up to 2× AUTOSCAN_MAX_DAILY alerts. alerts_log survives restarts —
+    # use today's persisted 'scan' rows as the floor. (Counts logged alerts,
+    # i.e. attempted — conservative in the safe direction for a risk cap.)
+    try:
+        persisted_fired = len(subscriptions.get_alerts_for_date(category="scan"))
+        if persisted_fired > _today_signals_fired:
+            logger.info("autoscan: daily-cap counter restored from DB "
+                        "(%d fired today, in-memory had %d)",
+                        persisted_fired, _today_signals_fired)
+            _today_signals_fired = persisted_fired
+    except Exception as e:
+        logger.warning("autoscan: cap restore from DB failed: %s", e)
+
     new_signals = 0
     for c in qualifying:
         # Daily risk cap (#6): never fire more than AUTOSCAN_MAX_DAILY a day.
@@ -876,7 +963,6 @@ async def _autoscan_tick(app: Application) -> None:
             continue
         subscriptions.mark_fired(key)
         new_signals += 1
-        _today_signals_fired += 1
 
         # Log once (system-level alert; not per-user — outcome is identical)
         subscriptions.log_alert(
@@ -901,11 +987,23 @@ async def _autoscan_tick(app: Application) -> None:
                 msg += "\n\n" + news
         except Exception as e:
             logger.warning("autoscan: news enrich for %s failed: %s", c.symbol, e)
+        delivered = 0
         for uid in subs:
             try:
                 await app.bot.send_message(uid, msg, parse_mode="Markdown")
+                delivered += 1
             except Exception as e:
                 logger.warning("autoscan: send to %s failed: %s", uid, e)
+        # The daily cap is a RISK cap — it should count signals the user could
+        # actually act on. An alert Telegram failed to deliver to anyone must
+        # not consume the budget. (Dedup + journal above stay marked either
+        # way: at-most-once per setup, and the call record reflects the
+        # system's decision even if delivery hiccuped.)
+        if delivered:
+            _today_signals_fired += 1
+        else:
+            logger.warning("autoscan: %s alert delivered to 0 subscriber(s) — "
+                           "not counted against the daily cap", c.symbol)
 
     if new_signals:
         logger.info("autoscan: fired %d new strong candidate(s) to %d sub(s)",
@@ -1071,8 +1169,8 @@ async def swing_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if wl_count == 0:
             msg += (
-                f"📋 *No watchlist set* — defaulting to all NSE-listed stocks "
-                f"({len(SWING_UNIVERSE)} stocks).\n"
+                f"📋 *No watchlist set* — defaulting to the liquid F&O universe "
+                f"({len(INTRADAY_UNIVERSE)} stocks).\n"
                 f"Add stocks via `/watch SYMBOL` to scan only those instead."
             )
         else:
@@ -1111,12 +1209,12 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "2️⃣ `/swing_alerts on`\n"
         "      → end-of-day BUY/SELL signals at 3:45 PM IST\n\n"
         "3️⃣ `/eod_report on`\n"
-        "      → daily summary at 3:35 PM IST\n\n"
+        "      → daily summary at 4:20 PM IST\n\n"
         "That's it.\n\n"
         "*Tomorrow during NSE hours (9:30 AM – 2:30 PM IST):*\n"
         "• Auto intraday alerts when setups fire\n"
-        "• Daily summary at 3:35 PM\n"
-        "• Swing signals at 3:45 PM\n\n"
+        "• Swing signals at 3:45 PM\n"
+        "• Daily summary at 4:20 PM\n\n"
         "To stop any alert: send the same command with `off`.\n"
         "Example: `/scan_alerts off`",
         [("← Back to menu", "guide:menu")],
@@ -1158,7 +1256,7 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "analysis on stocks and sends BUY/SELL signals.\n\n"
         "*Universe scanned:*\n"
         "• If you've used `/watch SYMBOL` → just those\n"
-        f"• Otherwise → all {len(SWING_UNIVERSE)} NSE-listed stocks\n\n"
+        f"• Otherwise → the {len(INTRADAY_UNIVERSE)} liquid F&O stocks\n\n"
         "*Example signal:*\n"
         "```\n"
         "🌅 End-of-Day Swing Signal\n"
@@ -1185,7 +1283,8 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "*`/today`* — on-demand report right now.\n"
         "Shows every alert fired today + outcome (T1/SL/expired) "
         "+ paper P&L.\n\n"
-        "*`/eod_report on`* — same report, automatic at 3:35 PM IST daily.\n\n"
+        "*`/eod_report on`* — same report, automatic at 4:20 PM IST daily "
+        "(after the swing run, so the day's swing calls are included).\n\n"
         "*Example:*\n"
         "```\n"
         "📊 End-of-Day Report — 2026-05-08\n"
@@ -1253,10 +1352,10 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "15:00  Manage open intraday positions\n"
         "15:15  Mandatory square-off (close everything)\n"
         "15:30  NSE closes\n"
-        "15:35  📊 EOD report arrives in your chat\n"
-        "        → review wins/losses for the day\n"
         "15:45  🌅 Swing alerts arrive\n"
         "        → set positional orders for tomorrow\n"
+        "16:20  📊 EOD report arrives in your chat\n"
+        "        → review the day incl. swing calls\n"
         "```",
         [("← Back to menu", "guide:menu")],
     ),
@@ -1372,7 +1471,6 @@ async def universe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wl = subscriptions.get_watchlist(user_id)
     intraday_n = len(INTRADAY_UNIVERSE)
-    swing_n = len(SWING_UNIVERSE)
     intraday_sample = ", ".join(INTRADAY_UNIVERSE[:10])
     msg = (
         "*📡 Stock universes*\n\n"
@@ -1388,17 +1486,28 @@ async def universe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         msg += (
-            f"  Watchlist empty → defaulting to all NSE-listed stocks "
-            f"= *{swing_n} stocks*\n"
+            f"  Watchlist empty → defaulting to the liquid F&O universe "
+            f"= *{intraday_n} stocks*\n"
             "  Add personal stocks via `/watch SYMBOL` to override.\n"
         )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-def _is_swing_run_window(now: datetime | None = None) -> bool:
-    """Are we in the daily swing-run window? Mon–Fri only."""
-    now = now or datetime.now(IST)
+def _is_trading_day(now: datetime) -> bool:
+    """Mon–Fri and not an NSE trading holiday. Shared by every daily window —
+    without the holiday check, swing alerts would fire on e.g. Diwali with
+    stale (last trading day's) candles, and EOD/heartbeat would run on a
+    closed market."""
     if now.weekday() >= 5:
+        return False
+    from market_calendar import is_trading_holiday
+    return not is_trading_holiday(now.date())
+
+
+def _is_swing_run_window(now: datetime | None = None) -> bool:
+    """Are we in the daily swing-run window? Trading days only."""
+    now = now or datetime.now(IST)
+    if not _is_trading_day(now):
         return False
     return SWING_RUN_WINDOW[0] <= now.time() < SWING_RUN_WINDOW[1]
 
@@ -1428,15 +1537,20 @@ async def _swing_alert_tick(app: Application) -> None:
         watchlist = subscriptions.get_watchlist(uid)
         used_universe = False
         if not watchlist:
-            # Fall back to SWING_UNIVERSE so users get alerts without curating.
-            watchlist = list(SWING_UNIVERSE)
+            # Fall back to the LIQUID F&O universe (~210 names), NOT all
+            # ~2,500 NSE equities: a full-market pass costs one Angel daily
+            # fetch per symbol (up to 30s each) — worst case runs for hours
+            # and burns thousands of calls against the daily quota, leaving
+            # tomorrow's intraday scan pre-throttled. ~210 names ≈ a few
+            # minutes and stays within budget.
+            watchlist = list(INTRADAY_UNIVERSE)
             used_universe = True
             try:
                 await app.bot.send_message(
                     uid,
                     f"🌅 *End-of-Day Swing Run*\n\n"
-                    f"Watchlist empty — scanning all "
-                    f"{len(watchlist)} NSE-listed stocks, "
+                    f"Watchlist empty — scanning the "
+                    f"{len(watchlist)} liquid F&O stocks, "
                     f"sending the top {SWING_MAX_ALERTS} by confidence.\n"
                     "Add stocks via `/watch SYMBOL` to scan only those.",
                     parse_mode="Markdown",
@@ -1535,8 +1649,11 @@ async def _swing_alert_loop(app: Application) -> None:
 
 # ---------- End-of-day report ----------
 
-# Daily report fires once in this window (15:35–16:05 IST)
-EOD_RUN_WINDOW = (dt_time(15, 35), dt_time(16, 5))
+# Daily report fires once in this window (16:20–16:50 IST). Deliberately AFTER
+# the swing-alert run (15:45–16:15): at the old 15:35 slot, swing alerts didn't
+# exist yet when the report was built, so the day's swing calls never appeared
+# in ANY automatic EOD report (the next day's report queries the next date).
+EOD_RUN_WINDOW = (dt_time(16, 20), dt_time(16, 50))
 EOD_LOOP_TICK_SEC = 300  # check every 5 min
 
 
@@ -1549,7 +1666,7 @@ async def eod_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sub = subscriptions.is_eod_subscribed(user_id)
         await update.message.reply_text(
             f"📡 EOD report: *{'ON' if sub else 'OFF'}*\n\n"
-            "`/eod_report on`  — receive a daily summary at 15:35 IST\n"
+            "`/eod_report on`  — receive a daily summary at 16:20 IST\n"
             "`/eod_report off` — stop\n"
             "`/today`          — on-demand report right now",
             parse_mode="Markdown",
@@ -1560,7 +1677,7 @@ async def eod_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscriptions.eod_subscribe(user_id)
         await update.message.reply_text(
             "✅ EOD report *ON*.\n\n"
-            "After NSE close (15:35 IST) you'll get a summary of every alert "
+            "After NSE close (16:20 IST) you'll get a summary of every alert "
             "fired today + outcome (T1/T2/SL/expired) + hypothetical P&L.\n\n"
             "Run `/today` anytime to fetch it on demand.",
             parse_mode="Markdown",
@@ -1602,7 +1719,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _is_eod_run_window(now: datetime | None = None) -> bool:
     now = now or datetime.now(IST)
-    if now.weekday() >= 5:
+    if not _is_trading_day(now):
         return False
     return EOD_RUN_WINDOW[0] <= now.time() < EOD_RUN_WINDOW[1]
 
@@ -1678,15 +1795,17 @@ async def _eod_report_loop(app: Application) -> None:
 # ---------- Swing-trade completion notifier ----------
 # Swing calls span days. Once a day after close we resolve open trades and push
 # a final-result message to whoever received each call the moment it finishes
-# (target / SL / breakeven), plus their running swing record. Runs after the EOD
-# window so daily candles are settled; the per-outcome `notified` flag guarantees
-# exactly-once delivery even across restarts.
+# (target / SL / breakeven), plus their running swing record. Runs after the
+# 15:30 close so daily candles are settled; overlaps the 16:20 EOD window —
+# both call resolve_pending, which is idempotent (open-alerts-only) and
+# DB-serialized. The per-outcome `notified` flag guarantees exactly-once
+# delivery even across restarts.
 SWING_OUTCOME_WINDOW = (dt_time(16, 10), dt_time(16, 40))
 
 
 def _is_swing_outcome_window(now: datetime | None = None) -> bool:
     now = now or datetime.now(IST)
-    if now.weekday() >= 5:
+    if not _is_trading_day(now):
         return False
     return SWING_OUTCOME_WINDOW[0] <= now.time() < SWING_OUTCOME_WINDOW[1]
 
@@ -1757,7 +1876,7 @@ HEARTBEAT_WINDOW = (dt_time(9, 0), dt_time(9, 15))
 
 def _is_heartbeat_window(now: datetime | None = None) -> bool:
     now = now or datetime.now(IST)
-    if now.weekday() >= 5:
+    if not _is_trading_day(now):
         return False
     return HEARTBEAT_WINDOW[0] <= now.time() < HEARTBEAT_WINDOW[1]
 
@@ -1774,6 +1893,23 @@ async def _heartbeat_tick(app: Application) -> None:
     active = angel_session_active()
     logger.info("heartbeat: alive — provider=%s, angel_active=%s", provider, active)
 
+    # Loop-liveness check: every core loop wraps its tick in try/except, so a
+    # loop TASK finishing at all means something structural killed it — the
+    # bot would look alive (process up, commands answered) while alerts are
+    # silently dead. Detect and warn. (A done telethon task is likewise a
+    # problem: it means the listener exited, e.g. unauthorized session.)
+    # Limitation: the heartbeat can't detect its OWN death — only systemd can.
+    dead_tasks = []
+    for task_key in _BACKGROUND_TASK_KEYS:
+        if task_key == "heartbeat_task":
+            continue
+        t = app.bot_data.get(task_key)
+        if t is not None and t.done():
+            dead_tasks.append(task_key.replace("_task", ""))
+    if dead_tasks:
+        logger.error("heartbeat: background loop(s) DEAD: %s — restart the "
+                     "service to recover", ", ".join(dead_tasks))
+
     if not active:
         try:
             await asyncio.to_thread(force_angel_login)
@@ -1781,12 +1917,18 @@ async def _heartbeat_tick(app: Application) -> None:
             logger.warning("heartbeat: Angel re-login failed: %s", e)
         active = angel_session_active()
 
-    if not active:
+    if not active or dead_tasks:
         recipients = set(subscriptions.get_subscribers()) | set(
             subscriptions.get_swing_subscribers())
-        warn = ("⚠️ *Data feed degraded* — the primary broker session is down "
-                "this morning. Signals may be delayed or use the fallback source. "
-                "I'll keep retrying.")
+        problems = []
+        if not active:
+            problems.append("the primary broker session is down")
+        if dead_tasks:
+            problems.append(f"these loops have died: {', '.join(dead_tasks)}")
+        warn = ("⚠️ *Bot health warning* — " + "; ".join(problems) + ". "
+                "Signals may be delayed or missing. "
+                + ("Restart the service to recover the dead loop(s)."
+                   if dead_tasks else "I'll keep retrying."))
         for uid in recipients:
             try:
                 await app.bot.send_message(uid, warn, parse_mode="Markdown")

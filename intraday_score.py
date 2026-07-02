@@ -46,6 +46,11 @@ WATCH = 60
 # --- ORB windows (5-min candles): 15-min = 3, 30-min = 6 ---------------------
 ORB_WINDOWS = {15: 3, 30: 6}
 
+# Beyond this % past the ORB level the move is treated as SPENT, not breaking
+# out: a stock 3–5% past its opening range at 2 PM is a chase, and entry would
+# be the extended current price with an ATR stop hung off it. No points.
+ORB_MAX_EXTENSION_PCT = 2.0
+
 
 @dataclass
 class ScoreCard:
@@ -113,12 +118,16 @@ def _gap_pct(df: pd.DataFrame, today_df: pd.DataFrame, priors: list) -> float | 
 
 def _rvol(today_df: pd.DataFrame, priors: list) -> float | None:
     """Time-of-day matched relative volume: today's cumulative volume so far
-    vs the average cumulative volume of prior days up to the same candle count."""
+    vs the average cumulative volume of prior days up to the same candle count.
+
+    Prior days with FEWER than n candles (half-days, muhurat, data gaps) are
+    excluded from the baseline — summing a truncated day whole deflates the
+    average and inflates today's RVOL, faking a volume-spike signal."""
     if not priors:
         return None
     n = len(today_df)
     today_cum = float(today_df["Volume"].iloc[:n].sum())
-    prior_cums = [float(p["Volume"].iloc[:n].sum()) for p in priors if len(p) >= 1]
+    prior_cums = [float(p["Volume"].iloc[:n].sum()) for p in priors if len(p) >= n]
     prior_cums = [c for c in prior_cums if c > 0]
     if not prior_cums:
         return None
@@ -128,7 +137,8 @@ def _rvol(today_df: pd.DataFrame, priors: list) -> float | None:
 
 def _orb_breakout(today_df: pd.DataFrame, price: float):
     """Evaluate both ORB windows; return the stronger confirmed breakout as
-    (window_minutes, direction, strength_pct) or (None, 'none', 0.0)."""
+    (window_minutes, direction, strength_pct) or (None, 'none', 0.0).
+    Breakouts extended beyond ORB_MAX_EXTENSION_PCT are ignored (spent move)."""
     best = (None, "none", 0.0)
     for minutes, n in ORB_WINDOWS.items():
         if len(today_df) <= n:          # need candles beyond the ORB to break out
@@ -136,11 +146,11 @@ def _orb_breakout(today_df: pd.DataFrame, price: float):
         hi, lo = orb_levels(today_df, n)
         if price > hi:
             strength = (price - hi) / hi * 100
-            if strength > best[2]:
+            if strength <= ORB_MAX_EXTENSION_PCT and strength > best[2]:
                 best = (minutes, "long", strength)
         elif price < lo:
             strength = (lo - price) / lo * 100
-            if strength > best[2]:
+            if strength <= ORB_MAX_EXTENSION_PCT and strength > best[2]:
                 best = (minutes, "short", strength)
     return best
 
@@ -334,17 +344,27 @@ def score_stock(df: pd.DataFrame, symbol: str,
     except Exception:
         pass
 
-    # Market-index regime gate: when every fetched index trends AGAINST the
-    # trade, the setup is counter-trend. regime_ok=False lets the alert layer
-    # suppress it (the score itself is unchanged — only the firing gate cares).
+    # Market-index regime gate: block ONLY when every fetched index trends
+    # OUTRIGHT AGAINST the trade (true counter-trend). A flat/mixed regime is
+    # allowed with a note — flat is "no support", not "opposed", and blocking
+    # it would silently suppress every signal in sideways sessions (which is
+    # not what "no counter-trend" means). regime_ok=False lets the alert layer
+    # suppress; the score itself is unchanged. When idx_trend is empty (index
+    # fetch failed), the gate is EXPLICITLY fail-open: annotated here, logged
+    # by the autoscan layer.
     regime_ok = True
     idx_trend = idx_trend or {}
     if idx_trend:
         context.append("Index: " + ", ".join(f"{k} {v}" for k, v in idx_trend.items()))
         want = "bullish" if long else "bearish"
-        if all(v != want for v in idx_trend.values()):
+        opposite = "bearish" if long else "bullish"
+        if all(v == opposite for v in idx_trend.values()):
             regime_ok = False
-            notes.append(f"Market index not {want} — counter-trend setup")
+            notes.append(f"All indices {opposite} — counter-trend setup")
+        elif all(v != want for v in idx_trend.values()):
+            notes.append("Indices flat/mixed — no regime support")
+    else:
+        notes.append("Index regime unavailable — regime gate inactive")
 
     if daily_df is not None and len(daily_df) >= 30:
         hi52 = float(daily_df["High"].tail(252).max())
@@ -369,11 +389,21 @@ def score_stock(df: pd.DataFrame, symbol: str,
 
         # Earnings proximity (cached daily NSE calendar) — event risk. A hit
         # within 2 days flips event_ok so the alert layer can suppress the trade.
+        # DELIBERATELY fail-open when the calendar itself didn't load (blocking
+        # every alert whenever NSE's flaky API is down is worse) — but say so,
+        # instead of silently pretending the symbol is event-clear.
         dte = _days_to_earnings(symbol)
         if dte is not None and 0 <= dte <= 2:
             event_ok = False
             when = "today" if dte == 0 else f"in {dte}d"
             notes.append(f"Earnings {when} — event risk")
+        elif dte is None:
+            try:
+                import market_context
+                if not market_context.earnings_data_available():
+                    notes.append("Earnings calendar unavailable — event risk unchecked")
+            except Exception:
+                pass
 
     return ScoreCard(
         symbol=symbol, price=price, direction=direction, score=score,

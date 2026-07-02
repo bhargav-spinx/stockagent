@@ -2,14 +2,24 @@
 Market data provider.
 
 Uses Angel One SmartAPI when ANGEL_API_KEY is configured (realtime broker feed).
-Falls back to yfinance (free, ~15 min delayed) when Angel creds are not set,
-so the bot keeps working during development.
+yfinance (free, ~15 min delayed) is used when Angel creds are NOT set, so the
+bot keeps working during development.
+
+Fallback semantics — deliberate, not an accident:
+- INDICES fall back to yfinance when the Angel fetch fails (regime context is
+  better delayed than absent).
+- STOCKS do NOT fall back when Angel is configured: silently mixing 15-min
+  delayed candles into intraday signal generation would produce entries/stops
+  computed on stale prices — worse than an honest error. A stock fetch failure
+  surfaces as an error and the symbol is skipped for that pass.
 """
 
 import os
 import json
 import time
+import random
 import logging
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 _angel_session = None
 _scrip_master = None
+_scrip_master_date = None   # IST date the in-memory master was loaded on
 SCRIP_MASTER_PATH = Path(__file__).parent / "angel_scrip_master.json"
 SCRIP_MASTER_URL = (
     "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -78,11 +89,35 @@ def _angel_login():
     return smart
 
 
+# Login serialization + storm brake. fetch paths run on asyncio worker THREADS
+# (to_thread), so without a lock two threads can race _get_angel_session() into
+# concurrent generateSession calls. And without a cooldown, a network outage
+# mid-scan re-attempts login per symbol per retry — hundreds of TOTP logins in
+# minutes, which Angel rate-limits and can temp-lock the account.
+_login_lock = threading.Lock()
+_last_login_failure = 0.0            # time.monotonic() of the last failed login
+LOGIN_COOLDOWN_SEC = 60
+
+
 def _get_angel_session():
-    """Lazy-init / reuse the Angel session."""
-    global _angel_session
-    if _angel_session is None:
-        _angel_session = _angel_login()
+    """Lazy-init / reuse the Angel session. Thread-safe; failed logins arm a
+    cooldown so an outage can't turn into a login storm."""
+    global _angel_session, _last_login_failure
+    if _angel_session is not None:
+        return _angel_session
+    with _login_lock:
+        if _angel_session is not None:      # another thread won the race
+            return _angel_session
+        since_fail = time.monotonic() - _last_login_failure
+        if since_fail < LOGIN_COOLDOWN_SEC:
+            raise RuntimeError(
+                f"Angel login on cooldown ({LOGIN_COOLDOWN_SEC - since_fail:.0f}s "
+                "left) after a recent failure — not retrying yet")
+        try:
+            _angel_session = _angel_login()
+        except Exception:
+            _last_login_failure = time.monotonic()
+            raise
     return _angel_session
 
 
@@ -91,14 +126,29 @@ def _reset_angel_session():
     _angel_session = None
 
 
+# Only errors that look like a dead/expired session justify re-login. A
+# connection error, DNS failure or 5xx does NOT — re-authing on those turns an
+# ordinary network blip into a per-symbol login storm.
+_AUTH_ERROR_MARKERS = ("token", "session", "login", "auth", "unauthor",
+                       "invalid credentials", "ag8001", "ab8050", "ab8051")
+
+
+def _looks_like_auth_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(m in s for m in _AUTH_ERROR_MARKERS)
+
+
 def force_angel_login() -> dict:
     """
     Force a fresh Angel One login, replacing any existing session.
-    Returns a minimal status dict.
+    Deliberately bypasses the failure cooldown (explicit operator action via
+    /angel_login) and clears it on success. Returns a minimal status dict.
     """
-    global _angel_session
-    _angel_session = None
-    _angel_session = _angel_login()
+    global _angel_session, _last_login_failure
+    with _login_lock:
+        _angel_session = None
+        _angel_session = _angel_login()
+        _last_login_failure = 0.0
     return {
         "ok": True,
         "client_code": os.getenv("ANGEL_CLIENT_CODE"),
@@ -126,36 +176,43 @@ def _is_rate_limited(resp: dict) -> bool:
 
 
 def _get_candle_data(params: dict, label: str) -> dict:
-    """Fetch candles with re-auth-on-exception and backoff-on-rate-limit.
+    """Fetch candles with backoff-on-rate-limit and auth-aware re-login.
 
     Returns the raw Angel response (status truthy, data present) or raises
     ValueError with the provider's message. Rate-limited responses are retried
-    with exponential backoff; a stale session is re-authed once per attempt.
+    with exponential backoff. Re-login happens ONLY for auth-shaped errors —
+    a network blip must not trigger a login per symbol per attempt (login
+    storm → Angel lockout); those just back off and retry the same session.
     """
     last_msg = ""
     for attempt in range(CANDLE_MAX_RETRIES):
         try:
             resp = _get_angel_session().getCandleData(params)
         except Exception as e:
-            # Session may have expired — re-auth once and retry this attempt.
-            logger.warning("Angel call failed for %s (%s); re-authenticating",
-                           label, e)
-            _reset_angel_session()
-            try:
-                resp = _get_angel_session().getCandleData(params)
-            except Exception as e2:
-                last_msg = str(e2)
-                if attempt < CANDLE_MAX_RETRIES - 1:
-                    time.sleep(CANDLE_BACKOFF_BASE_SEC * (2 ** attempt))
-                    continue
-                raise ValueError(f"No Angel data for {label}: {last_msg}")
+            last_msg = str(e)
+            if _looks_like_auth_error(e):
+                # Session expired/revoked — drop it; next attempt re-logins
+                # (subject to the login lock + cooldown).
+                logger.warning("Angel auth error for %s (%s); dropping session",
+                               label, e)
+                _reset_angel_session()
+            else:
+                logger.warning("Angel call failed for %s (%s); will retry "
+                               "same session", label, e)
+            if attempt < CANDLE_MAX_RETRIES - 1:
+                time.sleep(CANDLE_BACKOFF_BASE_SEC * (2 ** attempt))
+                continue
+            raise ValueError(f"No Angel data for {label}: {last_msg}")
 
         if resp.get("status") and resp.get("data"):
             return resp
 
         last_msg = str(resp.get("message"))
         if _is_rate_limited(resp) and attempt < CANDLE_MAX_RETRIES - 1:
+            # Jittered exponential backoff — desynchronizes retries if scans
+            # ever run concurrently (e.g. manual /scan during the auto loop).
             wait = CANDLE_BACKOFF_BASE_SEC * (2 ** attempt)
+            wait += random.uniform(0, wait * 0.5)
             logger.warning("Angel rate-limited on %s (%s) — backing off %.1fs "
                            "(attempt %d/%d)", label, last_msg, wait,
                            attempt + 1, CANDLE_MAX_RETRIES)
@@ -168,10 +225,15 @@ def _get_candle_data(params: dict, label: str) -> dict:
 
 
 def _load_scrip_master():
-    """Load Angel's symbol→token map. Cached on disk; refreshed once per day."""
-    global _scrip_master
-    if _scrip_master is not None:
+    """Load Angel's symbol→token map. Cached on disk (re-downloaded when >24h
+    old) AND in memory — the in-memory copy is invalidated on IST date change
+    so a long-running process picks up new listings / token remaps daily
+    instead of holding the first day's map until restart."""
+    global _scrip_master, _scrip_master_date
+    today = datetime.now(IST).date()
+    if _scrip_master is not None and _scrip_master_date == today:
         return _scrip_master
+    _scrip_master_date = today
 
     needs_download = True
     if SCRIP_MASTER_PATH.exists():
@@ -328,7 +390,9 @@ def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.Dat
     """
     Fetch OHLCV. Routes:
     - Indices (^... or known aliases) → Angel by token, yfinance fallback
-    - Stocks → Angel by SYMBOL-EQ lookup, yfinance fallback
+    - Stocks → Angel by SYMBOL-EQ lookup; NO yfinance fallback when Angel is
+      configured (see module docstring — delayed data must not silently feed
+      intraday signals). yfinance is used only when Angel creds are absent.
     """
     from indices import get_index_info
     idx_info = get_index_info(symbol)

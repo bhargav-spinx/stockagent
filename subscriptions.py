@@ -11,7 +11,17 @@ from contextlib import contextmanager
 from datetime import datetime, date, timezone
 from pathlib import Path
 
+from constants import IST
+
 DB_PATH = Path(__file__).parent / "stockagent.db"
+
+
+def _ist_today() -> date:
+    """Trade-date = the IST calendar date, NOT the server's local/UTC date.
+    The GCP VM runs UTC; date.today() there only matches the IST trade date
+    because NSE hours happen to sit inside one UTC day — a fragile accident.
+    Every trade_date / dedup key must go through this instead."""
+    return datetime.now(IST).date()
 
 
 @contextmanager
@@ -212,7 +222,7 @@ def get_watchlist(user_id: int) -> list[str]:
 
 def signal_key(symbol: str, setup: str, direction: str,
                trade_date: date | None = None) -> str:
-    trade_date = trade_date or date.today()
+    trade_date = trade_date or _ist_today()
     return f"{symbol}:{setup}:{direction}:{trade_date.isoformat()}"
 
 
@@ -223,7 +233,7 @@ def already_fired(key: str) -> bool:
 
 
 def mark_fired(key: str) -> None:
-    today = date.today().isoformat()
+    today = _ist_today().isoformat()
     with _conn() as c:
         c.execute(
             "INSERT OR IGNORE INTO fired_signals(key, fired_at, trade_date) VALUES (?, ?, ?)",
@@ -232,7 +242,12 @@ def mark_fired(key: str) -> None:
 
 
 def purge_old_signals(keep_days: int = 2) -> int:
-    """Drop signals older than keep_days. Returns rows deleted."""
+    """Drop signals older than keep_days. Returns rows deleted.
+
+    Retention cutoffs here and in purge_old_data use SQLite's date('now'),
+    which is UTC — up to 5.5h behind IST. Deliberately left as-is: against
+    multi-day retention windows the skew only delays deletion slightly (the
+    safe direction). Trade-date WRITES, by contrast, must be IST (_ist_today)."""
     with _conn() as c:
         cur = c.execute(
             "DELETE FROM fired_signals "
@@ -346,7 +361,7 @@ def log_alert(
 ) -> int:
     """Insert an alert row. Returns new alert_id."""
     generated_at = generated_at or datetime.now(timezone.utc)
-    trade_date = date.today().isoformat()
+    trade_date = _ist_today().isoformat()
     with _conn() as c:
         cur = c.execute(
             """
@@ -365,7 +380,7 @@ def get_alerts_for_date(trade_date_str: str | None = None,
                        category: str | None = None,
                        user_id: int | None = None) -> list[dict]:
     """Return all alerts (with outcomes if any) matching the filters."""
-    trade_date_str = trade_date_str or date.today().isoformat()
+    trade_date_str = trade_date_str or _ist_today().isoformat()
     sql = """
         SELECT a.id, a.generated_at, a.trade_date, a.category, a.user_id,
                a.symbol, a.setup, a.direction, a.entry, a.stop_loss,

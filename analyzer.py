@@ -169,6 +169,11 @@ def build_trade_setup(df: pd.DataFrame, signal: str, last_price: float,
     """
     Generate entry / stop-loss / targets / risk level from ATR + recent swings.
     Returns levels for BUY/SELL; for HOLD returns breakout watch levels.
+
+    NOTE: this is the SWING/positional risk model (stop = tighter of ATR-mult
+    vs swing extreme; targets 1.5R / 3R). The intraday scanner/scorer uses a
+    DIFFERENT deliberate model — scanner_indicators.trade_levels (1.5×ATR stop,
+    2R / 3R targets). See the note there before unifying anything.
     """
     lookback = 20 if mode == "swing" else 30
     recent = df.tail(lookback)

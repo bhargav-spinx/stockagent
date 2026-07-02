@@ -7,7 +7,6 @@ recent ones (preserving the /stats record). CI-safe (subscriptions = stdlib).
 import os
 import sys
 import tempfile
-from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,7 +43,10 @@ def test_purge_drops_old_keeps_recent():
     res = subscriptions.purge_old_data()
     assert res["alerts_log"] >= 1, res
 
-    today_rows = subscriptions.get_alerts_for_date(date.today().isoformat())
+    # No-arg default = IST trade date, matching what log_alert wrote. Using
+    # date.today() here would flake on UTC CI runners between 18:30–24:00 UTC
+    # (server date one day behind IST).
+    today_rows = subscriptions.get_alerts_for_date()
     symbols = {r["symbol"] for r in today_rows}
     assert "NEW" in symbols          # recent kept
     # old one is gone
