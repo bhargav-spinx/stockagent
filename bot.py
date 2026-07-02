@@ -5,6 +5,7 @@ Run: python bot.py
 
 import asyncio
 import os
+import time
 import logging
 from datetime import datetime, time as dt_time
 
@@ -780,10 +781,11 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscriptions.subscribe(user_id)
         await update.message.reply_text(
             f"✅ Auto-scan alerts *ON*.\n\n"
-            f"I'll scan {len(INTRADAY_UNIVERSE)} liquid F&O stocks "
-            f"every 5 minutes during NSE hours (09:30–14:30 IST, excluding "
-            f"12:00–13:30 lunch) and ping you with only the *top {AUTOSCAN_MAX_ALERTS} "
-            f"strongest* setups (score ≥{AUTOSCAN_MIN_SCORE}) each pass.\n\n"
+            f"I'll scan {len(INTRADAY_UNIVERSE)} liquid F&O stocks in rotating "
+            f"batches (full coverage every ~15 min) during NSE hours "
+            f"(09:30–14:30 IST, excluding 12:00–13:30 lunch) and ping you with "
+            f"only the *top {AUTOSCAN_MAX_ALERTS} strongest* setups "
+            f"(score ≥{AUTOSCAN_MIN_SCORE}) each pass.\n\n"
             f"Same stock won't be re-sent the same day (dedup).\n"
             f"`/scan_alerts off` to stop.",
             parse_mode="Markdown",
@@ -814,6 +816,12 @@ AUTOSCAN_SCAN_TIMEOUT_SEC = 280       # < AUTOSCAN_INTERVAL_SEC (300)
 AUTOSCAN_SCAN_BUDGET_SEC = 240
 SWING_SYMBOL_TIMEOUT_SEC = 30
 
+# Rate-limit circuit breaker: when an entire pass is denied with quota errors,
+# retrying every 5 min just burns ~200+ more calls into a dead quota (and keeps
+# the block rolling). Open the breaker and skip scan ticks for a cooldown.
+RATE_LIMIT_PAUSE_SEC = 900          # 15 min
+_rate_limit_pause_until = 0.0       # time.monotonic() deadline; 0 = closed
+
 # Overlap guard: handle to the in-flight scoring pass. A timed-out pass leaves
 # its worker thread running (threads aren't cancellable), so the next tick must
 # check task.done() — not a flag — to know whether it's truly finished.
@@ -822,15 +830,30 @@ _scan_task: "asyncio.Task | None" = None
 # this one stopped so tail symbols aren't permanently starved.
 _scan_offset = 0
 
+# Quota math forces batching: the full universe (~210) every 5 min is ~8,800
+# historical calls/day + retries — beyond Angel's quota, which is exactly the
+# sustained "exceeding access rate" block observed on 2026-07-02. Scanning a
+# rotating slice keeps the 5-min cadence, covers the whole universe every
+# ~15 min (3 ticks), and lands at ~2,940 calls/day. Tune with care: raising
+# this back toward the full universe re-creates the quota outage.
+AUTOSCAN_SYMBOLS_PER_TICK = 70
+
 
 async def _autoscan_tick(app: Application) -> None:
     """One pass of the auto-scan loop. Safe to call any time; no-ops outside market hours."""
     _reset_daily_stats_if_new_day()
     global _today_scans_completed, _today_scored_ok, _today_fetch_errors
     global _today_scan_timeouts, _last_fetch_error
-    global _scan_task, _scan_offset
+    global _scan_task, _scan_offset, _rate_limit_pause_until
 
     if not is_intraday_entry_window():
+        return
+
+    # Circuit breaker: provider quota exhausted on a recent pass — skip scan
+    # ticks until the cooldown elapses instead of feeding the block.
+    if time.monotonic() < _rate_limit_pause_until:
+        logger.info("autoscan: rate-limit breaker open — skipping tick (%.0fs left)",
+                    _rate_limit_pause_until - time.monotonic())
         return
 
     subs = subscriptions.get_subscribers()
@@ -846,12 +869,15 @@ async def _autoscan_tick(app: Application) -> None:
                      "tick (feed too slow for %d symbols?)", len(INTRADAY_UNIVERSE))
         return
 
-    # Rotate the universe so a budget-truncated pass resumes where it stopped.
+    # Rotate the universe and take this tick's slice (quota control — see
+    # AUTOSCAN_SYMBOLS_PER_TICK). A budget-truncated pass resumes where it
+    # stopped; a full pass hands the next slice to the next tick.
     universe_rot = (list(INTRADAY_UNIVERSE[_scan_offset:])
                     + list(INTRADAY_UNIVERSE[:_scan_offset]))
+    batch = universe_rot[:AUTOSCAN_SYMBOLS_PER_TICK]
 
-    logger.info("autoscan: scoring %d symbols for %d subscriber(s) (offset %d)",
-                len(universe_rot), len(subs), _scan_offset)
+    logger.info("autoscan: scoring %d of %d symbols for %d subscriber(s) (offset %d)",
+                len(batch), len(INTRADAY_UNIVERSE), len(subs), _scan_offset)
     # Market-index trend fetched once; shared across all symbols this pass.
     try:
         idx = await asyncio.wait_for(
@@ -870,7 +896,7 @@ async def _autoscan_tick(app: Application) -> None:
     # "cancelled" wrapper reports done() while its thread still runs, which
     # would defeat the overlap guard above.
     _scan_task = asyncio.create_task(
-        asyncio.to_thread(score_many, universe_rot, idx,
+        asyncio.to_thread(score_many, batch, idx,
                           deadline_sec=AUTOSCAN_SCAN_BUDGET_SEC))
     # Retrieve any exception from an abandoned (timed-out) pass so asyncio
     # doesn't log "Task exception was never retrieved".
@@ -890,10 +916,9 @@ async def _autoscan_tick(app: Application) -> None:
         logger.exception("autoscan: score_many crashed: %s", e)
         return
 
-    # Advance rotation: full pass → reset to 0; truncated pass → resume point.
-    if len(results) >= len(universe_rot):
-        _scan_offset = 0
-    else:
+    # Advance rotation by what was actually scanned (slice size, or less if
+    # the budget truncated) so the next tick picks up exactly where we left off.
+    if results:
         _scan_offset = (_scan_offset + len(results)) % len(INTRADAY_UNIVERSE)
 
     _today_scans_completed += 1
@@ -924,6 +949,14 @@ async def _autoscan_tick(app: Application) -> None:
         logger.error(
             "autoscan: ALL %d symbols errored this tick, 0 scored — candle feed "
             "broken. Last error: %s", errored_this_tick, _last_fetch_error)
+        # Quota-shaped failure → open the breaker: another pass in 5 min would
+        # throw 200+ more calls at a dead quota and keep the block rolling.
+        low = _last_fetch_error.lower()
+        if "access rate" in low or "rate-limited" in low or "too many requests" in low:
+            _rate_limit_pause_until = time.monotonic() + RATE_LIMIT_PAUSE_SEC
+            logger.error(
+                "autoscan: provider quota exhausted — pausing scans for %d min "
+                "to let the block clear", RATE_LIMIT_PAUSE_SEC // 60)
 
     # Fire only the very strongest setups (≥90) that are WITH the market regime
     # (#4) and clear of imminent earnings (event risk), top 5 per pass.
@@ -1059,7 +1092,7 @@ def _format_quiet_digest() -> str:
     lines = [
         "🌤 *Market quiet so far — 13:00 IST*\n",
         f"Scanned {len(INTRADAY_UNIVERSE)} liquid F&O stocks "
-        f"every 5 min since 09:30 AM.",
+        f"in rotating batches since 09:30 AM.",
         f"*Zero setups fired in {total_rejections} candle-checks.*\n",
         "*Why candles were rejected:*",
     ]
@@ -1222,8 +1255,9 @@ GUIDE_SECTIONS: dict[str, tuple[str, list[tuple[str, str]]]] = {
     "intraday": (
         "🟦 *Intraday Alerts (`/scan_alerts`)*\n\n"
         "*What it does:*\n"
-        f"Bot scans {len(INTRADAY_UNIVERSE)} liquid F&O stocks every "
-        "5 min during market hours. Pings you when a high-confluence setup fires.\n\n"
+        f"Bot scans {len(INTRADAY_UNIVERSE)} liquid F&O stocks in rotating "
+        "batches (full coverage ~15 min) during market hours. "
+        "Pings you when a high-confluence setup fires.\n\n"
         "*Example signal:*\n"
         "```\n"
         "🔔 Auto-Signal\n"

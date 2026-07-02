@@ -169,10 +169,18 @@ CANDLE_BACKOFF_BASE_SEC = 1.0
 _RATE_LIMIT_MARKERS = ("access rate", "rate limit", "too many requests")
 
 
+def _is_rate_limited_text(s: str) -> bool:
+    """Rate-limit detection on a raw message string. Needed because the SDK
+    THROWS on a throttled call (the response body is plaintext 'Access denied
+    because of exceeding access rate', which fails its JSON parse) — so the
+    rate limit surfaces as an exception, not a status:false response."""
+    s = s.lower()
+    return any(m in s for m in _RATE_LIMIT_MARKERS)
+
+
 def _is_rate_limited(resp: dict) -> bool:
-    msg = str(resp.get("message", "")).lower()
     code = str(resp.get("errorcode", "")).lower()
-    return any(m in msg for m in _RATE_LIMIT_MARKERS) or code == "ab1004"
+    return _is_rate_limited_text(str(resp.get("message", ""))) or code == "ab1004"
 
 
 def _get_candle_data(params: dict, label: str) -> dict:
@@ -196,11 +204,19 @@ def _get_candle_data(params: dict, label: str) -> dict:
                 logger.warning("Angel auth error for %s (%s); dropping session",
                                label, e)
                 _reset_angel_session()
+            elif _is_rate_limited_text(last_msg):
+                # Throttled call surfacing as an exception (see
+                # _is_rate_limited_text). Don't burn the remaining retries
+                # against a quota block — one attempt is enough to know.
+                logger.warning("Angel rate-limited (via exception) on %s — "
+                               "not retrying against a quota block", label)
+                raise ValueError(f"No Angel data for {label}: rate-limited: {last_msg}")
             else:
                 logger.warning("Angel call failed for %s (%s); will retry "
                                "same session", label, e)
             if attempt < CANDLE_MAX_RETRIES - 1:
-                time.sleep(CANDLE_BACKOFF_BASE_SEC * (2 ** attempt))
+                wait = CANDLE_BACKOFF_BASE_SEC * (2 ** attempt)
+                time.sleep(wait + random.uniform(0, wait * 0.5))
                 continue
             raise ValueError(f"No Angel data for {label}: {last_msg}")
 
