@@ -1,0 +1,31 @@
+# Reference systemd unit for the StockAgent bot (GCP VM, polling mode).
+# The live unit lives at /etc/systemd/system/stockbot.service and is created by
+# hand (see deploy/README.md). This tracked copy documents the intended config;
+# to apply changes on the VM:
+#
+#     sudo cp ~/stockagent/deploy/stockbot.service /etc/systemd/system/stockbot.service
+#     sudo systemctl daemon-reload && sudo systemctl restart stockbot
+#
+# .env is loaded by the app itself (load_dotenv), so there is deliberately no
+# EnvironmentFile= here.
+
+[Unit]
+Description=StockAgent Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ladanibhargav
+WorkingDirectory=/home/ladanibhargav/stockagent
+ExecStart=/home/ladanibhargav/stockagent/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+
+# Deploy restarts: the app now force-exits (os._exit) after a graceful stop, so
+# it normally dies in ~10s. This is a backstop — if a shutdown ever hangs on an
+# uninterruptible worker-thread fetch, SIGKILL it at 20s instead of the 90s
+# systemd default. Safe here: the SQLite DB is WAL and writes commit per-op.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

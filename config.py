@@ -182,6 +182,43 @@ class LiquidityConfig:
 
 
 @dataclass(frozen=True)
+class VolatilityConfig:
+    """engines/volatility.py — ATR percentile, NR7, inside day, squeeze."""
+    atr_period: int = 14
+    atr_pct_lookback: int = 60          # sessions for the ATR-percentile window
+    nr_lookback: int = 7                # NR7 window
+    compression_pctile: float = 25.0    # ATR%ile below → compressed (squeeze)
+    expansion_pctile: float = 75.0      # ATR%ile above → expanded
+
+
+@dataclass(frozen=True)
+class PriceActionConfig:
+    """engines/price_action.py — swing structure, BOS/CHoCH, S/R."""
+    fractal_n: int = 2                  # bars each side for a fractal pivot
+    swing_atr_mult: float = 0.5         # min pivot move in ATR to count as swing
+    swing_lookback: int = 60            # bars scanned for structure
+    sr_cluster_atr: float = 0.25        # S/R levels within this ATR frac merge
+
+
+@dataclass(frozen=True)
+class RelStrengthConfig:
+    """engines/relative_strength.py — return vs index over windows."""
+    index_alias: str = "NIFTY"
+    windows: tuple[int, ...] = (5, 20)  # daily-candle lookbacks for RS
+    beta_lookback: int = 20             # bars for the beta estimate
+
+
+@dataclass(frozen=True)
+class GapClassConfig:
+    """engines/gap.py classification — gap size measured in ATR units."""
+    tiny_atr: float = 0.5               # |gap|/ATR below → "tiny"
+    normal_atr: float = 1.5             # below → "normal", above → large
+    large_atr: float = 3.0             # above → "runaway/exhaustion" range
+    breakaway_rvol: float = 1.5         # large gap + this RVOL → breakaway
+    fill_frac: float = 0.5              # gap retraced ≥ this → fill candidate
+
+
+@dataclass(frozen=True)
 class RiskEngineConfig:
     """engines/risk.py — position sizing + daily risk budget.
 
@@ -207,6 +244,10 @@ class Config:
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     liquidity: LiquidityConfig = field(default_factory=LiquidityConfig)
     risk: RiskEngineConfig = field(default_factory=RiskEngineConfig)
+    volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
+    price_action: PriceActionConfig = field(default_factory=PriceActionConfig)
+    rel_strength: RelStrengthConfig = field(default_factory=RelStrengthConfig)
+    gap_class: GapClassConfig = field(default_factory=GapClassConfig)
 
 
 def _coerce(value: Any) -> Any:

@@ -170,7 +170,11 @@ stockagent/
 │   ├── liquidity.py       #   turnover, spread-proxy, slippage floors (proxies)
 │   ├── risk.py            #   fixed-fractional sizing + daily R budget
 │   ├── execution.py       #   itemized statutory Indian cost model
-│   └── context_daily.py   #   continuous indicator features (votes → numbers)
+│   ├── context_daily.py   #   continuous indicator features (votes → numbers)
+│   ├── volatility.py      #   ATR percentile, NR7, inside bar, squeeze state
+│   ├── price_action.py    #   swing structure, HH/HL/LH/LL, BOS/CHoCH, S/R
+│   └── relative_strength.py #  return vs index over windows, beta, RS rank
+├── feature_eval.py        # Feature evaluation harness (the referee — Phase 3.1)
 ├── analyzer.py            # Swing/intraday multi-indicator vote engine
 ├── intraday_score.py      # 100-point intraday scorecard (composes engines/)
 ├── scanner.py             # Intraday setup scanner (STRATEGY.md setups)
@@ -232,6 +236,17 @@ Analysis is organized as **independent engines** (`engines/`) that each return s
 - **Position sizing & daily risk budget** — set `risk.capital` (₹) in a `STOCKAGENT_CONFIG` overrides file to get fixed-fractional position sizes on alerts and a hypothetical-exposure section in the EOD report; set `risk.max_daily_risk_r` to stop signaling after that many R lost in a day.
 - **Statutory cost model** — `costs.model: "statutory"` (or `backtest.py --cost-model statutory`) replaces the flat 0.13%/round-trip estimate with itemized brokerage, STT, exchange, SEBI, stamp duty, GST and a separate slippage estimate; swing outcomes use delivery rates (higher STT/stamp), which the flat estimate understates.
 - **Probabilities are still never printed** — `TradeEvidence.probability_*` stays `None` until a calibrated, walk-forward-validated model exists (Phase 4 gate).
+
+## Feature engines & the evaluation harness
+
+Beyond the scorer, the platform computes a wide **feature set** on every fired alert (logged to `alerts_log.features`): gap classification (tiny/normal/breakaway/runaway/exhaustion + fill candidate), the VWAP state machine (hold/reclaim/failure, time-above, ATR-normalized distance), volume microstructure (curve-relative RVOL, acceleration, an honestly-labeled institutional proxy), volatility regime (ATR percentile, NR7, inside bar, squeeze), price-action structure (swing points, HH/HL/LH/LL, break-of-structure vs change-of-character, S/R), and relative strength vs the index. These are **features, not signals** — none of them gates a live trade.
+
+The discipline is enforced by `feature_eval.py`, the **evaluation harness**: it reads the `(features, resolved outcome)` pairs the bot collects and reports each feature's Spearman information coefficient, quintile outcome ladder, top-vs-bottom spread, first/second-half stability, and cross-feature correlation — all stamped with sample size, and flagged **underpowered** below a threshold so a lucky correlation on tiny data can't masquerade as edge.
+```bash
+python feature_eval.py                 # over all resolved+featured trades
+python feature_eval.py --outcome R     # rank features by R-multiple instead of %
+```
+No feature is promoted to a decision until it demonstrably separates outcomes here on real, out-of-sample data.
 
 ## Deployment
 

@@ -143,6 +143,57 @@ _VOTE_KEYS = {
 _VOTE_VALUE = {"BUY": 1, "HOLD": 0, "SELL": -1}
 
 
+def phase3_features(df, index_df=None, delivery_pct: float | None = None,
+                    direction: str = "long") -> dict:
+    """Rich Phase-3 engine features for ONE symbol's 5-min frame, flattened
+    with `p3_*` keys for the alert snapshot. Runs volatility, price-action,
+    VWAP-state, gap-classification, volume-microstructure and (when an index
+    frame is supplied) relative-strength.
+
+    Called FIRED-ALERT-ONLY (a handful/day), never on the universe scan hot
+    path — the per-symbol cost here would be wasteful ×hundreds and pressure
+    the Angel quota. TOTAL: any engine error degrades to a partial dict, never
+    an exception into the alert path (the caller also guards)."""
+    out: dict = {}
+    try:
+        from engines import (volatility, price_action, vwap as vwap_e,
+                             gap as gap_e, volume as vol_e,
+                             relative_strength as rs_e)
+        from scanner_indicators import split_sessions
+        from analyzer import atr as atr_fn
+
+        today, priors = split_sessions(df)
+        price = float(df["Close"].iloc[-1])
+        try:
+            atr_val = float(atr_fn(df, 14).iloc[-1])
+            atr_val = atr_val if atr_val == atr_val and atr_val > 0 else None
+        except Exception:
+            atr_val = None
+        atr_pct = (atr_val / price * 100) if (atr_val and price) else None
+        rvol_v = vol_e.rvol(today, priors)
+
+        def _merge(prefix: str, values: dict) -> None:
+            for k, v in (values or {}).items():
+                out[f"p3_{prefix}_{k}"] = _num(v) if not isinstance(v, str) else v
+
+        _merge("vol", volatility.evaluate(df).values)
+        _merge("pa", price_action.evaluate(df).values)
+        _merge("vwap", vwap_e.vwap_state(df, atr_val))
+        g = gap_e.gap_pct(today, priors)
+        _merge("gap", gap_e.classify_gap(
+            g, atr_pct, rvol_v, gap_e.gap_retrace_frac(g, today, priors)))
+        _merge("vx", {
+            "curve": vol_e.volume_curve_ratio(today, priors),
+            "accel": vol_e.volume_acceleration(df),
+            "inst": vol_e.institutional_proxy(rvol_v, delivery_pct, None),
+        })
+        if index_df is not None:
+            _merge("rs", rs_e.evaluate(df, index_df).values)
+    except Exception:
+        return out
+    return out
+
+
 def features_from_swing_result(result: dict, now: datetime | None = None) -> dict:
     """Snapshot for an analyzer.analyze() result dict (swing / manual alerts)."""
     setup = result.get("trade_setup") or {}

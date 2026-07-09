@@ -42,7 +42,10 @@ from analyzer import (
     signal_agreement, format_indicator_lines,
 )
 from config import CONFIG
-from features import features_from_scorecard, features_from_swing_result
+from features import (
+    features_from_scorecard, features_from_swing_result, phase3_features,
+)
+import features
 from data_provider import force_angel_login, angel_session_active, get_provider_name
 from scanner import (
     scan_many, format_signal_telegram, SCAN_PACING_SEC, TIER1_WATCHLIST,
@@ -1072,6 +1075,20 @@ async def _autoscan_tick(app: Application) -> None:
         subscriptions.mark_fired(key)
         new_signals += 1
 
+        # Rich Phase-3 engine features for THIS fired alert only (a handful/day,
+        # never the universe scan). One bounded refetch of the 5-min frame the
+        # scan already saw, off-thread + timeout-guarded; fail-open so a feature
+        # hiccup never blocks the alert. RS omitted here (needs an index frame;
+        # intraday RS is low-value — it belongs to the swing/daily path).
+        p3_feats: dict = {}
+        try:
+            p3df = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_data, c.symbol, "5d", "5m"), timeout=30)
+            p3_feats = await asyncio.to_thread(
+                features.phase3_features, p3df, None, c.delivery_pct, c.direction)
+        except Exception as e:
+            logger.warning("autoscan: phase3 features for %s skipped: %s", c.symbol, e)
+
         # Log once (system-level alert; not per-user — outcome is identical)
         subscriptions.log_alert(
             category="scan",
@@ -1087,6 +1104,7 @@ async def _autoscan_tick(app: Application) -> None:
             features=_merge_features(
                 _safe_features(features_from_scorecard, c, idx_trend=idx),
                 regime_feats,
+                p3_feats,
             ),
         )
 
@@ -2356,6 +2374,18 @@ def main():
     else:
         logger.info("Bot starting in polling mode")
         app.run_polling()
+
+    # Graceful shutdown (_post_shutdown) has already run by the time run_polling/
+    # run_webhook returns: Telethon stopped, background tasks cancelled, and all
+    # DB writes are WAL-committed per-operation, so nothing is buffered. Force an
+    # immediate exit instead of falling through to the interpreter's normal exit:
+    # asyncio.to_thread worker threads doing blocking (uninterruptible) Angel/yf
+    # fetches are non-daemon, so atexit's thread-join would hang until systemd
+    # SIGKILLs at the 90s stop-timeout. os._exit skips that join. Only reached on
+    # a clean return — if run_polling raised, the exception propagates (non-zero
+    # exit → systemd Restart=on-failure), which we want to preserve.
+    logger.info("shutdown complete — exiting")
+    os._exit(0)
 
 
 if __name__ == "__main__":
