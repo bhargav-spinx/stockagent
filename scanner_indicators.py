@@ -5,16 +5,19 @@ Reuses analyzer.py for atr/rsi/macd/bollinger.
 """
 import pandas as pd
 
+from config import CONFIG
 from constants import IST
 
 # Canonical intraday risk model (spec §Risk Management):
 # volatility-sized stop = ATR_SL_MULT × ATR, targets locked to R:R 1:2 / 1:3.
 # Single source of truth — both scanner_setups and intraday_score use it.
-ATR_PERIOD = 14
-ATR_SL_MULT = 1.5
-STOP_PCT_FALLBACK = 0.01   # used only when ATR is unavailable (thin data)
-RR_T1 = 2.0
-RR_T2 = 3.0
+# Values come from config.IntradayRiskConfig; the module-level names are kept
+# so existing importers keep working.
+ATR_PERIOD = CONFIG.intraday_risk.atr_period
+ATR_SL_MULT = CONFIG.intraday_risk.atr_sl_mult
+STOP_PCT_FALLBACK = CONFIG.intraday_risk.stop_pct_fallback
+RR_T1 = CONFIG.intraday_risk.rr_t1
+RR_T2 = CONFIG.intraday_risk.rr_t2
 
 
 def vwap(df: pd.DataFrame) -> pd.Series:

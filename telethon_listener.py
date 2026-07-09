@@ -377,6 +377,11 @@ class TelethonListener:
         ):
             try:
                 import subscriptions
+                try:
+                    from features import features_from_swing_result
+                    feats = features_from_swing_result(result)
+                except Exception:
+                    feats = None    # snapshot failure must not drop the alert
                 subscriptions.log_alert(
                     category="channel_tip",
                     user_id=self.notify_user_id,
@@ -385,6 +390,7 @@ class TelethonListener:
                     direction="long" if ts["action"] == "BUY" else "short",
                     entry=ts["entry"], stop_loss=ts["stop_loss"],
                     target1=ts["target1"], target2=ts["target2"],
+                    features=feats,
                 )
             except Exception as e:
                 logger.warning("channel tip log_alert failed for %s: %s",

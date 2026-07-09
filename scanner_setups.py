@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from analyzer import rsi as rsi_fn
+from config import CONFIG
 from scanner_indicators import vwap, ema, today_session, orb_levels, trade_levels
+
+_SA = CONFIG.setup_a
 
 # Entry/SL/target levels come from the canonical model in
 # scanner_indicators.trade_levels (ATR-sized stop, R:R 1:2 / 1:3) — shared with
@@ -52,13 +55,14 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
     - Skip if ORB range > 1.2% of stock price.
     """
     today = today_session(df)
-    if len(today) < 4:  # need ORB (3 candles) + at least one trigger candle
+    # need the ORB candles + at least one trigger candle
+    if len(today) < _SA.orb_candles + 1:
         return None
 
-    orb_high, orb_low = orb_levels(today, 3)
+    orb_high, orb_low = orb_levels(today, _SA.orb_candles)
     orb_range_pct = (orb_high - orb_low) / orb_low
 
-    if orb_range_pct > 0.012:
+    if orb_range_pct > _SA.max_orb_range_pct:
         return None  # ORB too wide — already extended
 
     last_candle = today.iloc[-1]
@@ -79,10 +83,11 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
             confluences.append(f"Price > VWAP ({vwap_val:.2f})")
         if ema9 > ema20:
             confluences.append(f"EMA9 > EMA20 ({ema9:.2f} > {ema20:.2f})")
-        if 55 <= rsi_val <= 70:
-            confluences.append(f"RSI {rsi_val:.0f} in 55–70 zone")
+        if _SA.rsi_long_lo <= rsi_val <= _SA.rsi_long_hi:
+            confluences.append(
+                f"RSI {rsi_val:.0f} in {_SA.rsi_long_lo:.0f}–{_SA.rsi_long_hi:.0f} zone")
 
-        if len(confluences) >= 3:
+        if len(confluences) >= _SA.min_confluences:
             sl, t1, t2 = trade_levels(last_price, "long", df)
             return Signal(
                 symbol=symbol, setup="A", direction="long",
@@ -101,10 +106,11 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
             confluences.append(f"Price < VWAP ({vwap_val:.2f})")
         if ema9 < ema20:
             confluences.append(f"EMA9 < EMA20 ({ema9:.2f} < {ema20:.2f})")
-        if 30 <= rsi_val <= 45:
-            confluences.append(f"RSI {rsi_val:.0f} in 30–45 zone")
+        if _SA.rsi_short_lo <= rsi_val <= _SA.rsi_short_hi:
+            confluences.append(
+                f"RSI {rsi_val:.0f} in {_SA.rsi_short_lo:.0f}–{_SA.rsi_short_hi:.0f} zone")
 
-        if len(confluences) >= 3:
+        if len(confluences) >= _SA.min_confluences:
             sl, t1, t2 = trade_levels(last_price, "short", df)
             return Signal(
                 symbol=symbol, setup="A", direction="short",

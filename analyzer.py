@@ -7,8 +7,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time, timedelta
 
+from config import CONFIG
 from data_provider import fetch_data, get_provider_name
 from constants import IST, trade_type_tag
+
+_SW = CONFIG.swing_setup
 
 
 # Per-mode indicator config. Swing = daily candles, slow indicators.
@@ -175,14 +178,14 @@ def build_trade_setup(df: pd.DataFrame, signal: str, last_price: float,
     DIFFERENT deliberate model — scanner_indicators.trade_levels (1.5×ATR stop,
     2R / 3R targets). See the note there before unifying anything.
     """
-    lookback = 20 if mode == "swing" else 30
+    lookback = _SW.lookback_swing if mode == "swing" else _SW.lookback_intraday
     recent = df.tail(lookback)
     swing_high = float(recent["High"].max())
     swing_low = float(recent["Low"].min())
 
     # Tighter stops for intraday (single session) vs swing (multi-day noise)
-    sl_mult = 1.5 if mode == "swing" else 1.0
-    tgt1_mult, tgt2_mult = 1.5, 3.0
+    sl_mult = _SW.sl_atr_mult_swing if mode == "swing" else _SW.sl_atr_mult_intraday
+    tgt1_mult, tgt2_mult = _SW.tgt1_mult, _SW.tgt2_mult
 
     setup = {
         "swing_high": round(swing_high, 2),
@@ -193,7 +196,7 @@ def build_trade_setup(df: pd.DataFrame, signal: str, last_price: float,
     if signal == "BUY":
         entry = last_price
         sl_atr = entry - atr_val * sl_mult
-        sl_swing = swing_low * 0.995  # 0.5% below recent swing low
+        sl_swing = swing_low * (1 - _SW.swing_stop_buffer)  # below recent swing low
         stop_loss = max(sl_atr, sl_swing)  # whichever is closer (less risk)
         risk = entry - stop_loss
         target1 = entry + risk * tgt1_mult
@@ -202,7 +205,7 @@ def build_trade_setup(df: pd.DataFrame, signal: str, last_price: float,
     elif signal == "SELL":
         entry = last_price
         sl_atr = entry + atr_val * sl_mult
-        sl_swing = swing_high * 1.005
+        sl_swing = swing_high * (1 + _SW.swing_stop_buffer)
         stop_loss = min(sl_atr, sl_swing)
         risk = stop_loss - entry
         target1 = entry - risk * tgt1_mult
@@ -210,16 +213,16 @@ def build_trade_setup(df: pd.DataFrame, signal: str, last_price: float,
         rr1 = tgt1_mult
     else:  # HOLD — give breakout watch levels instead
         setup["action"] = "WAIT"
-        setup["buy_breakout"] = round(swing_high * 1.002, 2)
-        setup["buy_breakout_sl"] = round(swing_high * 0.99, 2)
-        setup["sell_breakdown"] = round(swing_low * 0.998, 2)
-        setup["sell_breakdown_sl"] = round(swing_low * 1.01, 2)
+        setup["buy_breakout"] = round(swing_high * (1 + _SW.breakout_buffer), 2)
+        setup["buy_breakout_sl"] = round(swing_high * (1 - _SW.breakout_sl_buffer), 2)
+        setup["sell_breakdown"] = round(swing_low * (1 - _SW.breakout_buffer), 2)
+        setup["sell_breakdown_sl"] = round(swing_low * (1 + _SW.breakout_sl_buffer), 2)
         return setup
 
     risk_pct = (risk / entry) * 100
-    if risk_pct < 1.5:
+    if risk_pct < _SW.risk_low_pct:
         risk_level = "Low"
-    elif risk_pct < 3.5:
+    elif risk_pct < _SW.risk_medium_pct:
         risk_level = "Medium"
     else:
         risk_level = "High"
@@ -298,9 +301,9 @@ def analyze(symbol: str, mode: str = "swing") -> dict:
         signals.append(("SMA Trend", "SELL", "Short-term trend below long-term"))
 
     # 2. RSI
-    if rsi_val < 30:
+    if rsi_val < _SW.rsi_oversold:
         signals.append(("RSI", "BUY", f"Oversold (RSI={rsi_val:.1f})"))
-    elif rsi_val > 70:
+    elif rsi_val > _SW.rsi_overbought:
         signals.append(("RSI", "SELL", f"Overbought (RSI={rsi_val:.1f})"))
     else:
         signals.append(("RSI", "HOLD", f"Neutral (RSI={rsi_val:.1f})"))
@@ -328,10 +331,10 @@ def analyze(symbol: str, mode: str = "swing") -> dict:
     buy_count = votes.count("BUY")
     sell_count = votes.count("SELL")
 
-    if buy_count > sell_count and buy_count >= 2:
+    if buy_count > sell_count and buy_count >= _SW.min_votes:
         final = "BUY"
         confidence = (buy_count / len(votes)) * 100
-    elif sell_count > buy_count and sell_count >= 2:
+    elif sell_count > buy_count and sell_count >= _SW.min_votes:
         final = "SELL"
         confidence = (sell_count / len(votes)) * 100
     else:
@@ -339,6 +342,16 @@ def analyze(symbol: str, mode: str = "swing") -> dict:
         confidence = 50.0
 
     setup = build_trade_setup(df, final, float(last_price), float(atr_val), mode)
+
+    # Continuous context features (Phase 2.4): the ternary votes above stay
+    # the decision rule; these ride along into the alert feature snapshot so
+    # the learning pipeline gets numbers instead of votes. Local import breaks
+    # the analyzer ↔ engines.context_daily cycle; failure degrades to {}.
+    try:
+        from engines.context_daily import continuous_features
+        ctx_features = continuous_features(df, mode)
+    except Exception:
+        ctx_features = {}
 
     ist_now = datetime.now(IST)
     return {
@@ -353,6 +366,7 @@ def analyze(symbol: str, mode: str = "swing") -> dict:
         "confidence": round(confidence, 1),
         "indicators": signals,
         "trade_setup": setup,
+        "context_features": ctx_features,
         "market_open": is_nse_open(),
         "timestamp": ist_now.strftime("%Y-%m-%d %H:%M IST"),
     }

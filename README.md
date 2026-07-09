@@ -159,18 +159,33 @@ moves are close to noise. Treat the tooling as measurement, not a profit oracle:
 ```
 stockagent/
 ├── bot.py                 # Telegram handlers, auth gate, background loops
+├── config.py              # Central strategy config (all tunable thresholds)
+├── engines/               # Independent analysis engines (structured evidence,
+│   ├── base.py            #   never bare BUY/SELL): EngineResult contract
+│   ├── gap.py             #   opening-gap measurement + points
+│   ├── volume.py          #   RVOL / volume-breakout measurement + points
+│   ├── vwap.py            #   VWAP confirmation
+│   ├── orb.py             #   opening-range breakout (dual window, spent-move cap)
+│   ├── market_regime.py   #   day-type / volatility / breadth / expiry labels
+│   ├── liquidity.py       #   turnover, spread-proxy, slippage floors (proxies)
+│   ├── risk.py            #   fixed-fractional sizing + daily R budget
+│   ├── execution.py       #   itemized statutory Indian cost model
+│   └── context_daily.py   #   continuous indicator features (votes → numbers)
 ├── analyzer.py            # Swing/intraday multi-indicator vote engine
-├── intraday_score.py      # 100-point intraday scoring engine
+├── intraday_score.py      # 100-point intraday scorecard (composes engines/)
 ├── scanner.py             # Intraday setup scanner (STRATEGY.md setups)
 ├── scanner_filters.py     # Universal pre-trade filters
 ├── scanner_indicators.py  # Scanner-specific indicator math
 ├── scanner_setups.py      # ORB / VWAP / range setup detectors
 ├── data_provider.py       # Angel One SmartAPI primary, yfinance fallback
+├── data_archive.py        # Local 5-min candle archive + paged backfill CLI
 ├── indices.py             # NIFTY / Bank NIFTY / SENSEX definitions
 ├── universe.py            # NSE index constituents + daily dated snapshots
 ├── market_calendar.py     # NSE holiday calendar (nse_holidays.txt)
 ├── market_context.py      # Delivery %, earnings dates, Marketaux news
 ├── subscriptions.py       # SQLite state: watchlists, alert opt-ins, alert log
+├── features.py            # Decision-time feature snapshots (training data)
+├── evidence.py            # TradeEvidence structured-output contract
 ├── eod_report.py          # Daily outcome resolution vs published levels
 ├── stats.py               # Realized-performance stats from resolved outcomes
 ├── riskmetrics.py         # Sharpe/Sortino/t-stat/CI (stdlib-only)
@@ -193,8 +208,30 @@ stockagent/
 python backtest.py RELIANCE          # single symbol, scanner setups
 python backtest.py --watchlist      # tier-1 watchlist
 python backtest.py --watchlist --score --walkforward   # honest OOS numbers
+python backtest.py --watchlist --local                 # replay from the archive
 ```
 Replays 5-min history candle-by-candle through the **same** filters and detectors used live, simulates §7 partial-exit rules, and reports cost-adjusted stats. See `backtest.py --help` for all flags.
+
+## Candle archive & research data
+
+Provider history is capped (~60 days of 5-min via yfinance), so the bot **archives every fetched candle** to a local `market_data.db` automatically (disable with `ARCHIVE_DISABLED=true`). Seed deeper history and inspect coverage with:
+
+```bash
+python data_archive.py backfill --days 365 --universe tier1   # paged Angel fetch
+python data_archive.py coverage
+```
+
+`backtest.py --local` then replays from this frozen store — reproducible inputs, no provider cap.
+
+Alongside candles, every logged alert stores a **decision-time feature snapshot** (`alerts_log.features` JSON via `features.py`) and every resolved outcome stores **MFE/MAE and duration**. `subscriptions.get_training_rows()` exports the joined (features, outcome) pairs — the dataset any future probability model will train on. Strategy thresholds live in `config.py` (overridable via `STOCKAGENT_CONFIG=overrides.json`), pinned by golden-parity tests so a config typo can't silently change live signals.
+
+## Engines, risk layer & cost models
+
+Analysis is organized as **independent engines** (`engines/`) that each return structured evidence (`EngineResult`), never a bare BUY/SELL — the 100-point scorer now composes them, golden-parity-tested to identical output. Auto-scan alerts additionally log **market-regime features** (day-type, volatility state via India VIX, universe breadth, expiry flag) so regime-conditioned performance becomes measurable. All of the following are **off by default** and activate only via config:
+
+- **Position sizing & daily risk budget** — set `risk.capital` (₹) in a `STOCKAGENT_CONFIG` overrides file to get fixed-fractional position sizes on alerts and a hypothetical-exposure section in the EOD report; set `risk.max_daily_risk_r` to stop signaling after that many R lost in a day.
+- **Statutory cost model** — `costs.model: "statutory"` (or `backtest.py --cost-model statutory`) replaces the flat 0.13%/round-trip estimate with itemized brokerage, STT, exchange, SEBI, stamp duty, GST and a separate slippage estimate; swing outcomes use delivery rates (higher STT/stamp), which the flat estimate understates.
+- **Probabilities are still never printed** — `TradeEvidence.probability_*` stays `None` until a calibrated, walk-forward-validated model exists (Phase 4 gate).
 
 ## Deployment
 

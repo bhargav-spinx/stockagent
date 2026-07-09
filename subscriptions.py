@@ -6,6 +6,7 @@ Two tables:
 - fired_signals: dedup so the same setup doesn't alert twice on the
   same trading day. Keyed by (symbol, setup, direction, trade_date).
 """
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, date, timezone
@@ -129,6 +130,26 @@ def init_db() -> None:
         oc_cols = [r[1] for r in c.execute("PRAGMA table_info(alert_outcomes)").fetchall()]
         if "notified" not in oc_cols:
             c.execute("ALTER TABLE alert_outcomes ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
+        # Migration (Phase 1 quant platform): excursion + duration telemetry on
+        # outcomes. MFE/MAE turn each scarce resolved trade into several data
+        # points (were stops too tight? targets too far? time-stop well placed?).
+        for col in ("mfe_pct", "mae_pct", "duration_min"):
+            if col not in oc_cols:
+                c.execute(f"ALTER TABLE alert_outcomes ADD COLUMN {col} REAL")
+
+        # Migration (Phase 1 quant platform): decision-time telemetry on alerts.
+        #   score    — numeric score column (previously smuggled into `setup`
+        #              as the string "score{N}"; that string is still written
+        #              for backward compat with stats.py parsing).
+        #   features — JSON snapshot of every engine-computed value at call
+        #              time. This is the Learning Engine's training data;
+        #              features CANNOT be reconstructed later from re-fetched
+        #              candles (adjustments, provider caps, repaints).
+        al_cols = [r[1] for r in c.execute("PRAGMA table_info(alerts_log)").fetchall()]
+        if "score" not in al_cols:
+            c.execute("ALTER TABLE alerts_log ADD COLUMN score REAL")
+        if "features" not in al_cols:
+            c.execute("ALTER TABLE alerts_log ADD COLUMN features TEXT")
 
         c.execute("CREATE INDEX IF NOT EXISTS idx_signals_date ON fired_signals(trade_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_watch_user ON user_watchlist(user_id)")
@@ -358,22 +379,81 @@ def log_alert(
     target1: float,
     target2: float,
     generated_at: datetime | None = None,
+    score: float | None = None,
+    features: dict | None = None,
 ) -> int:
-    """Insert an alert row. Returns new alert_id."""
+    """Insert an alert row. Returns new alert_id.
+
+    `features` is the decision-time snapshot (see features.py builders) stored
+    as canonical JSON; `score` is the numeric engine score. Both optional —
+    older callers keep working unchanged."""
     generated_at = generated_at or datetime.now(timezone.utc)
     trade_date = _ist_today().isoformat()
+    features_json = (json.dumps(features, sort_keys=True, default=str)
+                     if features else None)
     with _conn() as c:
         cur = c.execute(
             """
             INSERT INTO alerts_log
                 (generated_at, trade_date, category, user_id, symbol, setup,
-                 direction, entry, stop_loss, target1, target2)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 direction, entry, stop_loss, target1, target2, score, features)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (generated_at.isoformat(), trade_date, category, user_id, symbol,
-             setup, direction, entry, stop_loss, target1, target2),
+             setup, direction, entry, stop_loss, target1, target2,
+             score, features_json),
         )
         return cur.lastrowid
+
+
+def get_alert_features(alert_id: int) -> dict | None:
+    """Parsed decision-time feature snapshot for one alert (None if absent)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT features FROM alerts_log WHERE id = ?", (alert_id,)
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def get_training_rows(categories: tuple[str, ...] | None = None) -> list[dict]:
+    """(features @ decision time, resolved outcome) pairs — the export the
+    future probability engine trains on. Only resolved alerts WITH a feature
+    snapshot qualify; rows are returned oldest-first."""
+    sql = """
+        SELECT a.id, a.generated_at, a.trade_date, a.category, a.symbol,
+               a.setup, a.direction, a.entry, a.stop_loss, a.target1,
+               a.target2, a.score, a.features,
+               o.status, o.exit_price, o.exit_time, o.pnl_pct,
+               o.mfe_pct, o.mae_pct, o.duration_min
+        FROM alerts_log a
+        JOIN alert_outcomes o ON o.alert_id = a.id
+        WHERE a.features IS NOT NULL
+    """
+    params: list = []
+    if categories:
+        sql += f" AND a.category IN ({','.join('?' * len(categories))})"
+        params.extend(categories)
+    sql += " ORDER BY a.generated_at"
+    cols = [
+        "id", "generated_at", "trade_date", "category", "symbol",
+        "setup", "direction", "entry", "stop_loss", "target1",
+        "target2", "score", "features",
+        "status", "exit_price", "exit_time", "pnl_pct",
+        "mfe_pct", "mae_pct", "duration_min",
+    ]
+    with _conn() as c:
+        rows = [dict(zip(cols, r)) for r in c.execute(sql, params).fetchall()]
+    for r in rows:
+        try:
+            r["features"] = json.loads(r["features"]) if r["features"] else None
+        except (TypeError, ValueError):
+            r["features"] = None
+    return rows
 
 
 def get_alerts_for_date(trade_date_str: str | None = None,
@@ -437,17 +517,22 @@ def save_outcome(
     exit_price: float | None = None,
     exit_time: datetime | None = None,
     pnl_pct: float | None = None,
+    mfe_pct: float | None = None,
+    mae_pct: float | None = None,
+    duration_min: float | None = None,
 ) -> None:
     with _conn() as c:
         c.execute(
             """
             INSERT OR REPLACE INTO alert_outcomes
-                (alert_id, status, exit_price, exit_time, pnl_pct, resolved_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (alert_id, status, exit_price, exit_time, pnl_pct,
+                 mfe_pct, mae_pct, duration_min, resolved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (alert_id, status, exit_price,
              exit_time.isoformat() if exit_time else None,
-             pnl_pct, datetime.now(timezone.utc).isoformat()),
+             pnl_pct, mfe_pct, mae_pct, duration_min,
+             datetime.now(timezone.utc).isoformat()),
         )
 
 

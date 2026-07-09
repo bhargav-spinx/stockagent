@@ -17,18 +17,22 @@ FACT  = a value read from the engine.   INTERPRETATION = a rule-based read of it
 """
 from __future__ import annotations
 
+from config import CONFIG
 from constants import DISCLAIMER, trade_type_tag
+
+_G = CONFIG.gates
+
 
 # --- §8 Conviction buckets (strength of confluence, NOT probability) ----------
 def conviction_bucket(strength: float | None, gate_passed: bool = True) -> str:
     """Map a 0–100 score (or swing confidence) to a conviction label."""
     if not gate_passed or strength is None:
         return "No-Trade"
-    if strength >= 90:
+    if strength >= _G.conviction_high:
         return "High confluence"
-    if strength >= 75:
+    if strength >= _G.conviction_constructive:
         return "Constructive"
-    if strength >= 60:
+    if strength >= _G.conviction_mixed:
         return "Mixed / needs confirmation"
     return "No-Trade"
 
@@ -53,18 +57,22 @@ def evaluate_gates_intraday(card) -> tuple[bool, list[str], list[str]]:
 
     if card.direction == "none":
         failed.append("No directional thesis (sideways/conflicting)")
-    if card.score < 60:
-        failed.append(f"Score {card.score} < 60 (below actionable floor)")
+    if card.score < _G.min_intraday_score:
+        failed.append(f"Score {card.score} < {_G.min_intraday_score} "
+                      "(below actionable floor)")
     if not card.regime_ok:
         failed.append("Index regime hostile (counter-trend)")
     if not card.event_ok:
         failed.append("Unresolved event risk (earnings within window)")
 
-    # R:R gate (T1 must be ≥ 1:2 by design; verify from actual levels)
+    # R:R gate (T1 must be ≥ 1:2 by design; verify from actual levels).
+    # Tolerance: canonical levels are BUILT at exactly 2R (entry + 2·risk), and
+    # `(entry + 2·risk) − entry` can land one ULP under 2·risk — without the
+    # epsilon this gate rejected its own levels with "R:R 2.00 < 2.0".
     if card.entry and card.stop_loss and card.target1:
         rr1, _ = _rr(card.entry, card.stop_loss, card.target1)
-        if rr1 < 2.0:
-            failed.append(f"R:R to T1 {rr1:.2f} < 2.0")
+        if rr1 < _G.min_rr - 1e-9:
+            failed.append(f"R:R to T1 {rr1:.2f} < {_G.min_rr}")
 
     for n in (card.notes or []):
         if "supertrend disagrees" in n.lower() or "low delivery" in n.lower():

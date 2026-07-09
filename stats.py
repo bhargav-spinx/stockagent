@@ -21,8 +21,10 @@ from eod_report import COST_PER_TRADE_PCT, _classify, _hold_days
 
 
 def _net_returns(rows: list[dict[str, Any]]) -> list[float]:
-    """Per-trade NET % returns from resolved rows (gross pnl minus costs)."""
-    return [r["pnl_pct"] - COST_PER_TRADE_PCT
+    """Per-trade NET % returns from resolved rows (gross pnl minus costs —
+    flat by default, itemized statutory when configured)."""
+    return [r["pnl_pct"] - eod_report.effective_cost_pct(
+                r.get("entry"), r.get("exit_price"), r.get("category"))
             for r in rows if r.get("pnl_pct") is not None]
 
 ALL_CATEGORIES = tuple(eod_report.INTRADAY_CATEGORIES | eod_report.SWING_CATEGORIES)
@@ -40,7 +42,12 @@ def _agg(rows: list[dict[str, Any]]) -> dict[str, Any]:
     losses = sum(1 for r in resolved if _classify(r.get("status")) == "fail")
     neutral = n - wins - losses
     gross = sum(r["pnl_pct"] for r in resolved)
-    net = gross - COST_PER_TRADE_PCT * n
+    # Per-trade cost dispatch: flat model (default) reproduces the historical
+    # `gross − 0.13·n` exactly; statutory itemizes per trade via engines/execution.
+    net = gross - sum(
+        eod_report.effective_cost_pct(r.get("entry"), r.get("exit_price"),
+                                      r.get("category"))
+        for r in resolved)
     decisive = wins + losses
     win_rate = (wins / decisive * 100) if decisive else 0.0
     holds = [d for d in (_hold_days(r) for r in resolved) if d is not None]
@@ -90,9 +97,12 @@ def build_stats_report() -> str:
     by_cat = {c: [r for r in rows if r["category"] == c] for c in ALL_CATEGORIES}
     scan_rows = by_cat.get("scan", [])
 
+    cost_note = (f"~{COST_PER_TRADE_PCT:.2f}% round-trip"
+                 if eod_report.CONFIG.costs.model == "flat"
+                 else "the itemized statutory cost model")
     parts = [
         "📈 *Performance stats* — realized outcomes\n",
-        f"_Net of ~{COST_PER_TRADE_PCT:.2f}% round-trip costs. Win rate over "
+        f"_Net of {cost_note}. Win rate over "
         "decisive (W+L) trades only._\n",
         "*Overall*",
         _line("All", _agg(rows)),

@@ -8,8 +8,15 @@ from datetime import datetime, time
 import pandas as pd
 
 from analyzer import atr as atr_fn
+from config import CONFIG
 from scanner_indicators import vwap, vwap_slope_pct, volume_ratio
 from constants import IST
+
+_FC = CONFIG.filters
+_ENTRY_OPEN = time(*_FC.entry_open)
+_ENTRY_CLOSE = time(*_FC.entry_close)
+_LUNCH_START = time(*_FC.lunch_start)
+_LUNCH_END = time(*_FC.lunch_end)
 
 
 @dataclass
@@ -36,9 +43,9 @@ def is_intraday_entry_window(now: datetime | None = None) -> bool:
     if is_trading_holiday(now.date()):
         return False
     t = now.time()
-    if t < time(9, 30) or t >= time(14, 30):
+    if t < _ENTRY_OPEN or t >= _ENTRY_CLOSE:
         return False
-    if time(12, 0) <= t < time(13, 30):
+    if _LUNCH_START <= t < _LUNCH_END:
         return False
     return True
 
@@ -55,16 +62,20 @@ def time_window_filter(now: datetime | None = None) -> FilterResult:
     if is_trading_holiday(now.date()):
         return FilterResult(False, "NSE trading holiday")
     t = now.time()
-    if t < time(9, 30):
-        return FilterResult(False, "Before 09:30 — ORB still forming")
-    if time(12, 0) <= t < time(13, 30):
-        return FilterResult(False, "Lunch window 12:00–13:30")
-    if t >= time(14, 30):
-        return FilterResult(False, "After 14:30 — no new entries (square-off pressure)")
+    if t < _ENTRY_OPEN:
+        return FilterResult(False, f"Before {_ENTRY_OPEN:%H:%M} — ORB still forming")
+    if _LUNCH_START <= t < _LUNCH_END:
+        return FilterResult(
+            False, f"Lunch window {_LUNCH_START:%H:%M}–{_LUNCH_END:%H:%M}")
+    if t >= _ENTRY_CLOSE:
+        return FilterResult(
+            False,
+            f"After {_ENTRY_CLOSE:%H:%M} — no new entries (square-off pressure)")
     return FilterResult(True)
 
 
-def atr_bounds_filter(df: pd.DataFrame, lo: float = 0.004, hi: float = 0.015) -> FilterResult:
+def atr_bounds_filter(df: pd.DataFrame, lo: float = _FC.atr_pct_lo,
+                      hi: float = _FC.atr_pct_hi) -> FilterResult:
     """ATR(14) on 5-min must be between 0.4% and 1.5% of price."""
     a = atr_fn(df, 14).iloc[-1]
     if pd.isna(a):
@@ -78,7 +89,8 @@ def atr_bounds_filter(df: pd.DataFrame, lo: float = 0.004, hi: float = 0.015) ->
     return FilterResult(True)
 
 
-def trigger_volume_filter(df: pd.DataFrame, ratio: float = 1.5) -> FilterResult:
+def trigger_volume_filter(df: pd.DataFrame,
+                          ratio: float = _FC.trigger_volume_ratio) -> FilterResult:
     """Trigger candle volume ≥ ratio × avg of last 12 candles' volume."""
     if len(df) < 13:
         return FilterResult(False, "Need 13+ candles for volume baseline")
@@ -93,7 +105,8 @@ def trigger_volume_filter(df: pd.DataFrame, ratio: float = 1.5) -> FilterResult:
     return FilterResult(True)
 
 
-def vwap_slope_filter(df: pd.DataFrame, min_slope_abs: float = 0.02) -> FilterResult:
+def vwap_slope_filter(df: pd.DataFrame,
+                      min_slope_abs: float = _FC.vwap_min_slope_abs) -> FilterResult:
     """VWAP must be sloping (not flat). min_slope_abs in % per candle."""
     s = vwap_slope_pct(vwap(df))
     if s is None:
@@ -104,7 +117,7 @@ def vwap_slope_filter(df: pd.DataFrame, min_slope_abs: float = 0.02) -> FilterRe
 
 
 def round_number_filter(df: pd.DataFrame, direction: str,
-                        threshold: float = 0.003) -> FilterResult:
+                        threshold: float = _FC.round_number_threshold) -> FilterResult:
     """
     Reject if price is within `threshold` of a major round number going
     AGAINST the trade direction.

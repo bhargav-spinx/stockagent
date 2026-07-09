@@ -33,6 +33,7 @@ import pandas as pd
 import pytz
 
 import subscriptions
+from config import CONFIG
 from data_provider import fetch_data
 from constants import IST
 
@@ -41,7 +42,10 @@ logger = logging.getLogger(__name__)
 # STRATEGY.md §8 cost model: ~0.05% brokerage/STT per side + ~0.05% slippage
 # entry + ~0.03% slippage exit ≈ 0.13% round-trip on tier-1 NSE stocks.
 # Single source of truth — imported by backtest.py and bot.py.
-COST_PER_TRADE_PCT = 0.13
+# Value lives in config.CostConfig; the module-level name is kept for importers.
+COST_PER_TRADE_PCT = CONFIG.costs.cost_per_trade_pct
+
+_TIME_STOP = timedelta(minutes=CONFIG.costs.intraday_time_stop_min)
 
 INTRADAY_CATEGORIES = {"scan", "manual_intraday"}
 # Channel tips are analysed on daily candles (swing horizon), so they resolve
@@ -54,6 +58,28 @@ SWING_CATEGORIES = {"swing_auto", "manual_swing", "channel_tip", "channel_call"}
 PASS_STATUSES = {"t2_hit", "t1_then_squareoff", "t1_then_breakeven"}
 FAIL_STATUSES = {"sl_hit"}
 NEUTRAL_STATUSES = {"time_stop", "squareoff_no_t1", "open", "no_data"}
+
+
+def effective_cost_pct(entry: float | None = None,
+                       exit_price: float | None = None,
+                       category: str | None = None) -> float:
+    """Round-trip cost % for one resolved trade.
+
+    Default (CONFIG.costs.model == "flat") returns the historical flat
+    COST_PER_TRADE_PCT — output byte-identical to before. model="statutory"
+    itemizes real charges via engines/execution, using DELIVERY rates for
+    swing-horizon categories (multi-day holds pay 0.1% STT both sides +
+    higher stamp duty, which the intraday-calibrated flat 0.13% understates).
+    Falls back to flat on any error — a cost model must never break a report."""
+    if CONFIG.costs.model == "flat" or not entry:
+        return COST_PER_TRADE_PCT
+    try:
+        from engines.execution import round_trip_cost_pct
+        product = "delivery" if category in SWING_CATEGORIES else "intraday"
+        return round_trip_cost_pct(entry, exit_price, product=product)
+    except Exception as e:
+        logger.warning("statutory cost model failed (%s) — using flat", e)
+        return COST_PER_TRADE_PCT
 
 
 # ---------- outcome resolver ----------
@@ -128,7 +154,30 @@ def resolve_intraday(alert: dict[str, Any],
     t1_hit = False
     t1_hit_time = None
 
+    # Excursion telemetry: best favorable (≥0) / worst adverse (≤0) % reached
+    # while the trade was live — candle-extreme granularity, exit candle
+    # included. MFE/MAE + duration make each scarce outcome several data
+    # points (stop placement, target reach, time-stop calibration).
+    mfe = 0.0
+    mae = 0.0
+
+    def _outcome(status: str, exit_price: float, ts, pnl: float) -> dict:
+        return {
+            "status": status,
+            "exit_price": exit_price,
+            "exit_time": ts,
+            "pnl_pct": round(pnl, 2),
+            "mfe_pct": round(mfe, 2),
+            "mae_pct": round(mae, 2),
+            "duration_min": round((ts - gen_time).total_seconds() / 60.0, 1),
+        }
+
     for ts, row in post.iterrows():
+        fav = float(row["High"] if direction == "long" else row["Low"])
+        adv = float(row["Low"] if direction == "long" else row["High"])
+        mfe = max(mfe, _signed_pct(entry, fav, direction))
+        mae = min(mae, _signed_pct(entry, adv, direction))
+
         if direction == "long":
             sl_in = row["Low"] <= sl
             t1_in = row["High"] >= t1
@@ -141,36 +190,23 @@ def resolve_intraday(alert: dict[str, Any],
         if not t1_hit:
             # Conservative: if SL and T1 both touched in same candle, assume SL first
             if sl_in:
-                return {
-                    "status": "sl_hit",
-                    "exit_price": sl,
-                    "exit_time": ts,
-                    "pnl_pct": round(_signed_pct(entry, sl, direction), 2),
-                }
+                return _outcome("sl_hit", sl, ts, _signed_pct(entry, sl, direction))
             # Time-stop: 45 min elapsed with neither SL nor T1. Checked AFTER
             # SL (a stop breach inside the boundary candle must count as a
             # stop, not a time-stop exit at that candle's close) and BEFORE
             # T1 grants continuation.
-            if not t1_in and (ts - gen_time) > timedelta(minutes=45):
+            if not t1_in and (ts - gen_time) > _TIME_STOP:
                 close = float(row["Close"])
-                return {
-                    "status": "time_stop",
-                    "exit_price": close,
-                    "exit_time": ts,
-                    "pnl_pct": round(_signed_pct(entry, close, direction), 2),
-                }
+                return _outcome("time_stop", close, ts,
+                                _signed_pct(entry, close, direction))
             if t1_in:
                 t1_hit = True
                 t1_hit_time = ts
                 # Check t2 in same candle
                 if t2_in:
                     # 50% at T1, 50% at T2 — blended from actual levels.
-                    return {
-                        "status": "t2_hit",
-                        "exit_price": t2,
-                        "exit_time": ts,
-                        "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2),
-                    }
+                    return _outcome("t2_hit", t2, ts,
+                                    _blended_pct(entry, t1, t2, direction))
         else:
             # After T1: SL is moved to entry per §7
             if direction == "long":
@@ -181,38 +217,22 @@ def resolve_intraday(alert: dict[str, Any],
                 t2_in_now = row["Low"] <= t2
 
             if t2_in_now:
-                return {
-                    "status": "t2_hit",
-                    "exit_price": t2,
-                    "exit_time": ts,
-                    "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2),
-                }
+                return _outcome("t2_hit", t2, ts,
+                                _blended_pct(entry, t1, t2, direction))
             if trail_sl_in:
                 # 50% booked at T1, 50% trailed out at entry (0%).
-                return {
-                    "status": "t1_then_breakeven",
-                    "exit_price": entry,
-                    "exit_time": ts,
-                    "pnl_pct": round(_blended_pct(entry, t1, entry, direction), 2),
-                }
+                return _outcome("t1_then_breakeven", entry, ts,
+                                _blended_pct(entry, t1, entry, direction))
 
     # End of candles: square off at last close
     last_ts = post.index[-1]
     last_close = float(post["Close"].iloc[-1])
     if t1_hit:
         # 50% booked at T1 + 50% squared off at last close — both from actuals.
-        return {
-            "status": "t1_then_squareoff",
-            "exit_price": last_close,
-            "exit_time": last_ts,
-            "pnl_pct": round(_blended_pct(entry, t1, last_close, direction), 2),
-        }
-    return {
-        "status": "squareoff_no_t1",
-        "exit_price": last_close,
-        "exit_time": last_ts,
-        "pnl_pct": round(_signed_pct(entry, last_close, direction), 2),
-    }
+        return _outcome("t1_then_squareoff", last_close, last_ts,
+                        _blended_pct(entry, t1, last_close, direction))
+    return _outcome("squareoff_no_t1", last_close, last_ts,
+                    _signed_pct(entry, last_close, direction))
 
 
 def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
@@ -242,7 +262,28 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
         return {"status": "open"}
 
     t1_hit = False
+
+    # Excursion telemetry — daily-bar granularity for swing alerts.
+    mfe = 0.0
+    mae = 0.0
+
+    def _outcome(status: str, exit_price: float, ts, pnl: float) -> dict:
+        return {
+            "status": status,
+            "exit_price": exit_price,
+            "exit_time": ts,
+            "pnl_pct": round(pnl, 2),
+            "mfe_pct": round(mfe, 2),
+            "mae_pct": round(mae, 2),
+            "duration_min": round((ts - gen_time).total_seconds() / 60.0, 1),
+        }
+
     for ts, row in post.iterrows():
+        fav = float(row["High"] if direction == "long" else row["Low"])
+        adv = float(row["Low"] if direction == "long" else row["High"])
+        mfe = max(mfe, _signed_pct(entry, fav, direction))
+        mae = min(mae, _signed_pct(entry, adv, direction))
+
         if direction == "long":
             sl_in = row["Low"] <= sl
             t1_in = row["High"] >= t1
@@ -254,21 +295,12 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
 
         if not t1_hit:
             if sl_in:
-                return {
-                    "status": "sl_hit",
-                    "exit_price": sl,
-                    "exit_time": ts,
-                    "pnl_pct": round(_signed_pct(entry, sl, direction), 2),
-                }
+                return _outcome("sl_hit", sl, ts, _signed_pct(entry, sl, direction))
             if t1_in:
                 t1_hit = True
                 if t2_in:
-                    return {
-                        "status": "t2_hit",
-                        "exit_price": t2,
-                        "exit_time": ts,
-                        "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2),
-                    }
+                    return _outcome("t2_hit", t2, ts,
+                                    _blended_pct(entry, t1, t2, direction))
         else:
             if direction == "long":
                 trail_sl_in = row["Low"] <= entry
@@ -277,12 +309,11 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
                 trail_sl_in = row["High"] >= entry
                 t2_in_now = row["Low"] <= t2
             if t2_in_now:
-                return {"status": "t2_hit", "exit_price": t2, "exit_time": ts,
-                        "pnl_pct": round(_blended_pct(entry, t1, t2, direction), 2)}
+                return _outcome("t2_hit", t2, ts,
+                                _blended_pct(entry, t1, t2, direction))
             if trail_sl_in:
-                return {"status": "t1_then_breakeven", "exit_price": entry,
-                        "exit_time": ts,
-                        "pnl_pct": round(_blended_pct(entry, t1, entry, direction), 2)}
+                return _outcome("t1_then_breakeven", entry, ts,
+                                _blended_pct(entry, t1, entry, direction))
 
     return {"status": "open"}
 
@@ -295,6 +326,38 @@ def resolve_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
         return resolve_swing(alert)
     logger.warning("resolve_alert: unknown category %s", cat)
     return None
+
+
+def today_intraday_realized_r() -> list[float]:
+    """R multiples for TODAY's intraday alerts, resolved against the current
+    session so far.
+
+    The daily-risk budget needs this: intraday alerts are otherwise only
+    resolved at EOD (16:20 IST), so a gate reading persisted pnl_pct would see
+    nothing during market hours and be inert exactly when it must protect. Here
+    each still-open intraday alert is resolved IN-MEMORY against today's 5-min
+    candles (mark-to-market: a stop hit earlier today books its −R; a runner
+    marks at the current close). Nothing is persisted — EOD resolution stays
+    the authoritative record. Best-effort: an alert whose fetch fails is
+    skipped, not counted."""
+    from engines.risk import realized_r      # local import avoids a cycle
+
+    today = subscriptions.get_alerts_for_date()
+    rows: list[dict] = []
+    for a in today:
+        if a["category"] not in INTRADAY_CATEGORIES:
+            continue
+        if a.get("pnl_pct") is not None:       # already persisted (rare intraday)
+            rows.append(a)
+            continue
+        try:
+            outcome = resolve_intraday(a)
+        except Exception:
+            outcome = None
+        if (outcome and outcome.get("pnl_pct") is not None
+                and outcome.get("status") not in ("open", "no_data")):
+            rows.append({**a, "pnl_pct": outcome["pnl_pct"]})
+    return realized_r(rows)
 
 
 def resolve_pending(max_age_days: int = 30) -> int:
@@ -316,6 +379,9 @@ def resolve_pending(max_age_days: int = 30) -> int:
             exit_price=outcome.get("exit_price"),
             exit_time=outcome.get("exit_time"),
             pnl_pct=outcome.get("pnl_pct"),
+            mfe_pct=outcome.get("mfe_pct"),
+            mae_pct=outcome.get("mae_pct"),
+            duration_min=outcome.get("duration_min"),
         )
         resolved += 1
     return resolved
@@ -417,20 +483,68 @@ def build_report(user_id: int | None = None,
     manual_intraday_rows = [r for r in all_today if r["category"] == "manual_intraday"]
     swing_rows = [r for r in all_today if r["category"] in SWING_CATEGORIES]
 
+    cost_note = (
+        f"_Gross of brokerage/STT/slippage (~{COST_PER_TRADE_PCT:.2f}% round-trip)._\n\n"
+        if CONFIG.costs.model == "flat" else
+        "_Gross figures; net columns apply the itemized statutory cost model._\n\n")
     parts = [
         f"📊 *End-of-Day Report* — {trade_date_str}\n",
         "_Hypothetical paper-trade outcomes assuming default 50/50 partial-exit rules._\n",
-        f"_Gross of brokerage/STT/slippage (~{COST_PER_TRADE_PCT:.2f}% round-trip)._\n\n",
+        cost_note,
         _format_section("🟦 Intraday auto-scan (/scan_alerts)", scan_rows),
         _format_section("🟧 Manual intraday (/intraday)", manual_intraday_rows),
         _format_section("🟪 Swing (/swing_alerts + /swing)", swing_rows),
     ]
+
+    # Hypothetical exposure at configured sizing (Phase 2, default OFF —
+    # rendered only when CONFIG.risk.capital is set).
+    if CONFIG.risk.capital:
+        exposure = _format_exposure_section()
+        if exposure:
+            parts.append(exposure)
 
     # If today had zero alerts and we have rejection stats, explain why
     if not all_today and today_rejection_stats:
         parts.append(_format_empty_day_explanation(today_rejection_stats))
 
     return "\n".join(parts)
+
+
+def _format_exposure_section() -> str:
+    """What exposure WOULD be if every currently-open alert were taken at the
+    configured fixed-fractional size. Signals-only platform — this is a
+    hypothetical risk view, not a brokerage position report; say so."""
+    try:
+        from engines.risk import position_size
+        open_alerts = subscriptions.get_open_alerts(max_age_days=30)
+        rows: list[str] = []
+        total = 0.0
+        for a in open_alerts:
+            sz = position_size(a["entry"], a["stop_loss"])
+            v = sz.values
+            if not (sz.ok and v.get("qty")):
+                continue
+            total += v["position_value_inr"]
+            sym = a["symbol"].replace(".NS", "").replace(".BO", "")
+            rows.append(f"• {sym} {a['direction']} — {v['qty']} sh "
+                        f"≈ ₹{v['position_value_inr']:,.0f}")
+        cap = CONFIG.risk.capital
+        lines = ["*📐 Hypothetical exposure (configured sizing)*"]
+        if not rows:
+            lines.append("_No open sized positions._")
+        else:
+            lines += rows
+            lines.append(f"Total ≈ ₹{total:,.0f} ({total / cap * 100:.0f}% of "
+                         f"capital) · position limit "
+                         f"{CONFIG.risk.max_concurrent_positions}")
+            if len(rows) > CONFIG.risk.max_concurrent_positions:
+                lines.append("⚠️ Open alerts exceed max_concurrent_positions — "
+                             "taking all of them would breach the limit.")
+        lines.append("_Hypothetical: sizes assume every open alert was taken._")
+        return "\n".join(lines) + "\n"
+    except Exception as e:
+        logger.warning("exposure section failed: %s", e)
+        return ""
 
 
 # ---------- swing-completion notification ----------
@@ -466,7 +580,8 @@ def swing_record_summary(records: list[dict[str, Any]]) -> str:
     losses = sum(1 for r in resolved if _classify(r.get("status")) == "fail")
     neutral = len(resolved) - wins - losses
     gross = sum(r["pnl_pct"] for r in resolved)
-    net = gross - COST_PER_TRADE_PCT * len(resolved)
+    net = gross - sum(effective_cost_pct(r.get("entry"), r.get("exit_price"),
+                                         r.get("category")) for r in resolved)
     win_rate = wins / len(resolved) * 100
     rec = f"{wins}W / {losses}L"
     if neutral:
@@ -504,8 +619,10 @@ def format_swing_completion(rec: dict[str, Any],
     if exit_p is not None:
         lines.append(f"Exit:  ₹{exit_p:.2f}")
     if pnl is not None:
-        net = pnl - COST_PER_TRADE_PCT
-        lines.append(f"Result: *{pnl:+.2f}%*  (net ~{net:+.2f}% after ~{COST_PER_TRADE_PCT:.2f}% costs)")
+        cost = effective_cost_pct(rec.get("entry"), rec.get("exit_price"),
+                                  rec.get("category"))
+        net = pnl - cost
+        lines.append(f"Result: *{pnl:+.2f}%*  (net ~{net:+.2f}% after ~{cost:.2f}% costs)")
     if record_summary:
         lines += ["", record_summary]
     lines += ["", "_Hypothetical paper-trade outcome, gross of slippage. "

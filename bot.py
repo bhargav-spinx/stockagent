@@ -41,6 +41,8 @@ from analyzer import (
     analyze, format_report, normalize_symbol,
     signal_agreement, format_indicator_lines,
 )
+from config import CONFIG
+from features import features_from_scorecard, features_from_swing_result
 from data_provider import force_angel_login, angel_session_active, get_provider_name
 from scanner import (
     scan_many, format_signal_telegram, SCAN_PACING_SEC, TIER1_WATCHLIST,
@@ -64,6 +66,27 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
 )
 logger = logging.getLogger(__name__)
+
+
+def _safe_features(builder, *args, **kwargs) -> dict | None:
+    """Build a decision-time feature snapshot; a snapshot bug must NEVER take
+    down the alert path, so any error degrades to features=None (logged)."""
+    try:
+        return builder(*args, **kwargs)
+    except Exception as e:
+        logger.warning("feature snapshot failed (%s): %s",
+                       getattr(builder, "__name__", "?"), e)
+        return None
+
+
+def _merge_features(*dicts: dict | None) -> dict | None:
+    """Merge feature snapshots from multiple engines (later keys win);
+    None when nothing was collected so log_alert stores NULL, not '{}'."""
+    merged: dict = {}
+    for d in dicts:
+        if d:
+            merged.update(d)
+    return merged or None
 
 
 # ---------- Access control (personal-use allowlist) ----------
@@ -221,6 +244,7 @@ async def _full_analysis(update: Update, symbol: str, mode: str):
                     stop_loss=ts["stop_loss"],
                     target1=ts["target1"],
                     target2=ts["target2"],
+                    features=_safe_features(features_from_swing_result, result),
                 )
     except asyncio.TimeoutError:
         await update.message.reply_text(
@@ -797,7 +821,7 @@ async def scan_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Auto-signal gate: only the very strongest setups fire, and only the top few
 # per pass — keeps the channel to a handful of high-conviction calls a day.
-AUTOSCAN_MIN_SCORE = 90    # score floor for an auto-signal (≥90 / 100)
+AUTOSCAN_MIN_SCORE = CONFIG.gates.autoscan_min_score  # score floor for an auto-signal
 AUTOSCAN_MAX_ALERTS = 5    # cap: send only the N highest-scoring per pass
 AUTOSCAN_MAX_DAILY = 8     # risk cap: stop firing once this many fired today
 
@@ -958,6 +982,34 @@ async def _autoscan_tick(app: Application) -> None:
                 "autoscan: provider quota exhausted — pausing scans for %d min "
                 "to let the block clear", RATE_LIMIT_PAUSE_SEC // 60)
 
+    # Market-regime snapshot (Phase 2): logged as FEATURES on every fired
+    # alert so regime-conditioned outcomes become measurable. The existing
+    # regime_ok veto below is untouched — regime is evidence, not a new gate.
+    # Breadth proxy: fraction of scored symbols above VWAP this tick (the
+    # universe is already fetched; a true A/D line needs market-wide quotes).
+    scored_cards = [r["scorecard"] for r in results if r["status"] == "scored"]
+    regime_feats: dict = {}
+    try:
+        from engines import market_regime
+        breadth = None
+        if scored_cards:
+            bull = sum(1 for sc in scored_cards
+                       if sc.signals.get("VWAP") == "Bullish")
+            breadth = bull / len(scored_cards)
+        # Bounded like every other feed-touching await in this tick
+        # (index_trend, score_many): the fetches are SDK/yfinance-timeout-
+        # protected, but wait_for keeps a slow feed from stretching the tick
+        # between scoring and alert-firing. Timeout ⇒ features skipped, alerts
+        # still fire (regime is evidence, never a gate).
+        snap = await asyncio.wait_for(
+            asyncio.to_thread(market_regime.live_snapshot, idx, breadth),
+            timeout=30)
+        regime_feats = snap.feature_dict("regime")
+    except asyncio.TimeoutError:
+        logger.warning("autoscan: regime snapshot timed out — features skipped")
+    except Exception as e:
+        logger.warning("autoscan: regime snapshot failed (features skipped): %s", e)
+
     # Fire only the very strongest setups (≥90) that are WITH the market regime
     # (#4) and clear of imminent earnings (event risk), top 5 per pass.
     qualifying = [r["scorecard"] for r in results
@@ -967,6 +1019,29 @@ async def _autoscan_tick(app: Application) -> None:
                   and r["scorecard"].event_ok]
     qualifying.sort(key=lambda c: c.score, reverse=True)
     qualifying = qualifying[:AUTOSCAN_MAX_ALERTS]
+
+    # Daily risk budget in R units (Phase 2, default OFF — max_daily_risk_r
+    # is None until configured). Uses today's intraday alerts resolved against
+    # the CURRENT session (eod_report.today_intraday_realized_r) — NOT persisted
+    # pnl_pct, which is empty until EOD and would make the gate inert during the
+    # very window it must protect. The resolution does per-alert fetches, so it
+    # runs off-thread and only when the operator opted into the cap.
+    # Fails OPEN: a risk check that errors must not silently kill alerting.
+    if CONFIG.risk.max_daily_risk_r is not None and qualifying:
+        try:
+            from engines.risk import DailyRiskLedger
+            r_list = await asyncio.to_thread(eod_report.today_intraday_realized_r)
+            ledger = DailyRiskLedger(CONFIG.risk.max_daily_risk_r)
+            for r_mult in r_list:
+                ledger.add_r(r_mult)
+            can_fire, why = ledger.allows_new_trade()
+            if not can_fire:
+                logger.warning(
+                    "autoscan: daily risk budget exhausted (%s) — "
+                    "suppressing %d qualifying signal(s)", why, len(qualifying))
+                qualifying = []
+        except Exception as e:
+            logger.warning("autoscan: daily-R budget check failed open: %s", e)
 
     global _today_signals_fired
     # Restart-safe daily cap: the in-memory counter dies with the process, so
@@ -1002,15 +1077,36 @@ async def _autoscan_tick(app: Application) -> None:
             category="scan",
             user_id=None,
             symbol=c.symbol,
-            setup=f"score{c.score}",
+            setup=f"score{c.score}",   # legacy string kept for stats.py parsing
             direction=c.direction,
             entry=c.entry,
             stop_loss=c.stop_loss,
             target1=c.target1,
             target2=c.target2,
+            score=float(c.score),
+            features=_merge_features(
+                _safe_features(features_from_scorecard, c, idx_trend=idx),
+                regime_feats,
+            ),
         )
 
         msg = "🔔 *Auto-Signal* — Strong Candidate\n\n" + intraday_score.format_scorecard(c)
+
+        # Position sizing (Phase 2, default OFF — capital is None until
+        # configured). Purely informational: which alerts fire is unchanged.
+        if CONFIG.risk.capital:
+            try:
+                from engines.risk import position_size
+                sz = position_size(c.entry, c.stop_loss)
+                v = sz.values
+                if sz.ok and v.get("qty"):
+                    msg += (
+                        f"\n\n📐 *Position (fixed-fractional):* {v['qty']} shares"
+                        f" ≈ ₹{v['position_value_inr']:,.0f}"
+                        f" · at risk ₹{v['risk_amount_inr']:,.0f}"
+                        f" ({CONFIG.risk.risk_per_trade_pct:.1f}% budget)")
+            except Exception as e:
+                logger.warning("autoscan: position sizing failed: %s", e)
         # Enrich ONLY fired alerts with live news (Marketaux, rate-limited) —
         # never the universe scan. ≤ AUTOSCAN_MAX_DAILY/day keeps us well under
         # the 100 req/day budget. Degrades silently if unavailable.
@@ -1636,6 +1732,8 @@ async def _swing_alert_tick(app: Application) -> None:
                     stop_loss=ts["stop_loss"],
                     target1=ts["target1"],
                     target2=ts["target2"],
+                    score=float(result.get("confidence") or 0) or None,
+                    features=_safe_features(features_from_swing_result, result),
                 )
             msg = (
                 "📅 *SWING / POSITIONAL* · hold days to weeks\n\n"

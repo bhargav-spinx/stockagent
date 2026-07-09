@@ -28,28 +28,37 @@ news (Marketaux) enriches only fired alerts in the bot layer, not this scorer.
 """
 from __future__ import annotations
 
-import statistics
 from dataclasses import dataclass, field
 
 import pandas as pd
 
+from config import CONFIG
 from constants import DISCLAIMER, trade_type_tag
+from engines import gap as gap_engine
+from engines import orb as orb_engine
+from engines import volume as volume_engine
+from engines import vwap as vwap_engine
 from scanner_indicators import (
     vwap, ema, supertrend,
-    localize_ist, split_sessions, orb_levels, volume_ratio, trade_levels,
+    localize_ist, split_sessions, volume_ratio, trade_levels,
 )
 
-# --- Rating thresholds -------------------------------------------------------
-STRONG = 80
-WATCH = 60
+# --- Rating thresholds (config.ScoreConfig; names kept for importers) --------
+STRONG = CONFIG.score.strong
+WATCH = CONFIG.score.watch
 
 # --- ORB windows (5-min candles): 15-min = 3, 30-min = 6 ---------------------
-ORB_WINDOWS = {15: 3, 30: 6}
+ORB_WINDOWS = dict(CONFIG.score.orb_windows)
 
 # Beyond this % past the ORB level the move is treated as SPENT, not breaking
 # out: a stock 3–5% past its opening range at 2 PM is a chase, and entry would
 # be the extended current price with an ATR stop hung off it. No points.
-ORB_MAX_EXTENSION_PCT = 2.0
+ORB_MAX_EXTENSION_PCT = CONFIG.score.orb_max_extension_pct
+
+# Phase 2.1: the component measurements + point rules live in engines/
+# (gap / volume / vwap / orb). This module composes them into the legacy
+# 100-point card — tests/test_golden_parity.py pins the composition as
+# byte-identical to the pre-extraction scorer.
 
 
 @dataclass
@@ -106,55 +115,6 @@ def _days_to_earnings(symbol: str):
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
-def _gap_pct(df: pd.DataFrame, today_df: pd.DataFrame, priors: list) -> float | None:
-    if not priors:
-        return None
-    prev_close = float(priors[-1]["Close"].iloc[-1])
-    today_open = float(today_df["Open"].iloc[0])
-    if prev_close == 0:
-        return None
-    return (today_open - prev_close) / prev_close * 100
-
-
-def _rvol(today_df: pd.DataFrame, priors: list) -> float | None:
-    """Time-of-day matched relative volume: today's cumulative volume so far
-    vs the average cumulative volume of prior days up to the same candle count.
-
-    Prior days with FEWER than n candles (half-days, muhurat, data gaps) are
-    excluded from the baseline — summing a truncated day whole deflates the
-    average and inflates today's RVOL, faking a volume-spike signal."""
-    if not priors:
-        return None
-    n = len(today_df)
-    today_cum = float(today_df["Volume"].iloc[:n].sum())
-    prior_cums = [float(p["Volume"].iloc[:n].sum()) for p in priors if len(p) >= n]
-    prior_cums = [c for c in prior_cums if c > 0]
-    if not prior_cums:
-        return None
-    avg = statistics.mean(prior_cums)
-    return today_cum / avg if avg > 0 else None
-
-
-def _orb_breakout(today_df: pd.DataFrame, price: float):
-    """Evaluate both ORB windows; return the stronger confirmed breakout as
-    (window_minutes, direction, strength_pct) or (None, 'none', 0.0).
-    Breakouts extended beyond ORB_MAX_EXTENSION_PCT are ignored (spent move)."""
-    best = (None, "none", 0.0)
-    for minutes, n in ORB_WINDOWS.items():
-        if len(today_df) <= n:          # need candles beyond the ORB to break out
-            continue
-        hi, lo = orb_levels(today_df, n)
-        if price > hi:
-            strength = (price - hi) / hi * 100
-            if strength <= ORB_MAX_EXTENSION_PCT and strength > best[2]:
-                best = (minutes, "long", strength)
-        elif price < lo:
-            strength = (lo - price) / lo * 100
-            if strength <= ORB_MAX_EXTENSION_PCT and strength > best[2]:
-                best = (minutes, "short", strength)
-    return best
-
-
 def _dir_conviction(score: int) -> int:
     """Map score → a 50–90 'conviction' lean in the trade direction.
 
@@ -162,7 +122,10 @@ def _dir_conviction(score: int) -> int:
     probability and is NOT calibrated against realized outcomes — do not present
     it as a win likelihood. The honest measure of how often a score bucket wins
     is the realized win rate in stats.py (available once trades have resolved)."""
-    return int(round(min(90, max(50, 45 + score * 0.42))))
+    cs = CONFIG.score
+    return int(round(min(cs.conviction_hi,
+                         max(cs.conviction_lo,
+                             cs.conviction_base + score * cs.conviction_slope))))
 
 
 # ----------------------------------------------------------------------------
@@ -225,13 +188,13 @@ def score_stock(df: pd.DataFrame, symbol: str,
     if len(today_df) < 4 or not priors:
         return _empty("Insufficient intraday data (need ≥2 sessions, 4+ candles today)")
 
-    # --- Raw measurements ---
-    gap = _gap_pct(df, today_df, priors)
-    rvol = _rvol(today_df, priors)
+    # --- Raw measurements (component engines) ---
+    gap = gap_engine.gap_pct(today_df, priors)
+    rvol = volume_engine.rvol(today_df, priors)
     vw = float(vwap(df).iloc[-1])
     e20 = float(ema(df["Close"], 20).iloc[-1])
     e50 = float(ema(df["Close"], 50).iloc[-1])
-    orb_win, orb_dir, orb_strength = _orb_breakout(today_df, price)
+    orb_win, orb_dir, orb_strength = orb_engine.orb_breakout(today_df, price)
     volbk = volume_ratio(df)
 
     # --- Direction vote: gap / VWAP / EMA / ORB ---
@@ -259,65 +222,36 @@ def score_stock(df: pd.DataFrame, symbol: str,
     # --- Component scoring (favourable = aligned with `direction`) ---
     breakdown, signals = {}, {}
 
+    cs = CONFIG.score
+
     # Gap (20)
-    fav_gap = (gap if long else -gap) if gap is not None else 0.0
-    if fav_gap >= 2:
-        gp = 20
-    elif fav_gap >= 1.5:
-        gp = 15
-    elif fav_gap >= 1.0:
-        gp = 10
-    elif fav_gap >= 0.5:
-        gp = 5
-    else:
-        gp = 0
-    breakdown["Gap Up/Down"] = gp
+    breakdown["Gap Up/Down"] = gap_engine.gap_points(gap, long, cs)
     signals["Gap"] = (f"{'Up' if (gap or 0) > 0 else 'Down'} {abs(gap):.2f}%"
                       if gap is not None else "n/a")
 
     # Relative Volume (25)
-    if rvol is None:
-        rp = 0
-    elif rvol >= 2:
-        rp = 25
-    elif rvol >= 1.5:
-        rp = 18
-    elif rvol >= 1.2:
-        rp = 10
-    else:
-        rp = 0
-    breakdown["Relative Volume"] = rp
+    breakdown["Relative Volume"] = volume_engine.rvol_points(rvol, cs)
     signals["Volume Spike"] = (f"{rvol:.2f}× avg" if rvol is not None else "n/a")
 
     # VWAP Confirmation (15)
-    vwap_ok = (price > vw) if long else (price < vw)
-    breakdown["VWAP Confirmation"] = 15 if vwap_ok else 0
+    breakdown["VWAP Confirmation"] = vwap_engine.confirmation_points(
+        price, vw, long, cs)
     signals["VWAP"] = "Bullish" if price > vw else "Bearish"
 
     # EMA Trend 20>50 (15)
     ema_ok = (e20 > e50) if long else (e20 < e50)
-    breakdown["EMA Trend"] = 15 if ema_ok else 0
+    breakdown["EMA Trend"] = cs.ema_points if ema_ok else 0
     signals["EMA Trend"] = "Bullish" if e20 > e50 else "Bearish"
 
     # ORB Breakout (15)
-    if orb_dir == direction:
-        op = 15 if orb_strength >= 0.10 else 8
-        signals["ORB Breakout"] = f"Confirmed ({orb_win}m, +{orb_strength:.2f}%)"
-    else:
-        op = 0
-        signals["ORB Breakout"] = "None"
-    breakdown["ORB Breakout"] = op
+    breakdown["ORB Breakout"] = orb_engine.orb_points(
+        orb_dir, direction, orb_strength, cs)
+    signals["ORB Breakout"] = (
+        f"Confirmed ({orb_win}m, +{orb_strength:.2f}%)"
+        if orb_dir == direction else "None")
 
     # Volume Breakout (10)
-    if volbk is None:
-        vbp = 0
-    elif volbk >= 1.5:
-        vbp = 10
-    elif volbk >= 1.2:
-        vbp = 5
-    else:
-        vbp = 0
-    breakdown["Volume Breakout"] = vbp
+    breakdown["Volume Breakout"] = volume_engine.volume_breakout_points(volbk, cs)
     signals["Volume Breakout"] = (f"{volbk:.2f}× last candle"
                                   if volbk is not None else "n/a")
 
@@ -367,11 +301,11 @@ def score_stock(df: pd.DataFrame, symbol: str,
         notes.append("Index regime unavailable — regime gate inactive")
 
     if daily_df is not None and len(daily_df) >= 30:
-        hi52 = float(daily_df["High"].tail(252).max())
-        lo52 = float(daily_df["Low"].tail(252).min())
-        if hi52 > 0 and (hi52 - price) / hi52 <= 0.03:
+        hi52 = float(daily_df["High"].tail(cs.w52_lookback_days).max())
+        lo52 = float(daily_df["Low"].tail(cs.w52_lookback_days).min())
+        if hi52 > 0 and (hi52 - price) / hi52 <= cs.near_52w_band:
             context.append("Near 52-week high")
-        elif lo52 > 0 and (price - lo52) / lo52 <= 0.03:
+        elif lo52 > 0 and (price - lo52) / lo52 <= cs.near_52w_band:
             context.append("Near 52-week low")
 
     # External context (live NSE) — skipped in backtests to stay offline.
@@ -382,9 +316,9 @@ def score_stock(df: pd.DataFrame, symbol: str,
         deliv = _delivery_pct(symbol)
         if deliv is not None:
             context.append(f"Delivery: {deliv:.0f}%")
-            if deliv >= 60:
+            if deliv >= cs.delivery_strong_pct:
                 context.append("strong delivery")
-            elif deliv < 25:
+            elif deliv < cs.delivery_low_pct:
                 notes.append("Low delivery % — intraday churn, weak conviction")
 
         # Earnings proximity (cached daily NSE calendar) — event risk. A hit
@@ -393,7 +327,7 @@ def score_stock(df: pd.DataFrame, symbol: str,
         # every alert whenever NSE's flaky API is down is worse) — but say so,
         # instead of silently pretending the symbol is event-clear.
         dte = _days_to_earnings(symbol)
-        if dte is not None and 0 <= dte <= 2:
+        if dte is not None and 0 <= dte <= cs.earnings_risk_days:
             event_ok = False
             when = "today" if dte == 0 else f"in {dte}d"
             notes.append(f"Earnings {when} — event risk")

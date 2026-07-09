@@ -16,6 +16,8 @@ only an OUT-OF-SAMPLE result counts (see backtest.walk_forward).
 from __future__ import annotations
 
 import math
+import random
+from collections import defaultdict
 from typing import Sequence
 
 
@@ -78,6 +80,81 @@ def t_stat(returns: Sequence[float]) -> float | None:
     return _mean(returns) / se
 
 
+def profit_factor(returns: Sequence[float]) -> float | None:
+    """Gross profit ÷ gross loss. None when there are no losing trades (the
+    ratio is undefined, and 'infinite profit factor' on a tiny sample is
+    exactly the kind of number that misleads) or no trades at all."""
+    gross_profit = sum(r for r in returns if r > 0)
+    gross_loss = -sum(r for r in returns if r < 0)
+    if not returns or gross_loss == 0:
+        return None
+    return gross_profit / gross_loss
+
+
+def max_drawdown(returns: Sequence[float]) -> float | None:
+    """Maximum peak-to-trough drawdown of the ADDITIVE cumulative %-return
+    equity curve (same convention as backtest.py: equal-weight, one unit per
+    trade, no compounding). Returned as a positive magnitude in percentage
+    points. None on an empty series."""
+    if not returns:
+        return None
+    equity = 0.0
+    peak = 0.0
+    dd = 0.0
+    for r in returns:
+        equity += r
+        peak = max(peak, equity)
+        dd = max(dd, peak - equity)
+    return dd
+
+
+def recovery_factor(returns: Sequence[float]) -> float | None:
+    """Total net return ÷ max drawdown, per-series. This is the honest,
+    annualisation-free cousin of Calmar (a true Calmar needs an annualised
+    return, and these trades have no fixed frequency — see module docstring).
+    None when drawdown is zero (no losing streak yet — not evidence of skill)."""
+    dd = max_drawdown(returns)
+    if not returns or dd is None or dd == 0:
+        return None
+    return sum(returns) / dd
+
+
+def bootstrap_ci95(returns: Sequence[float], n_boot: int = 2000,
+                   seed: int = 42) -> tuple[float, float] | None:
+    """Percentile-bootstrap 95% CI on the mean per-trade return.
+
+    Preferred over the normal-approx `mean_ci95` at the small n this project
+    actually operates at (n < 30), where trade returns are fat-tailed and the
+    normal approximation is optimistic. Deterministic for a given seed.
+    None when <2 trades."""
+    n = len(returns)
+    if n < 2:
+        return None
+    rng = random.Random(seed)
+    means = sorted(
+        _mean(rng.choices(returns, k=n)) for _ in range(n_boot)
+    )
+    lo_idx = int(0.025 * n_boot)
+    hi_idx = min(n_boot - 1, int(0.975 * n_boot))
+    return (means[lo_idx], means[hi_idx])
+
+
+def monthly_returns(dated_returns: Sequence[tuple[str, float]]) -> dict[str, dict]:
+    """Aggregate (iso_date_or_datetime_str, net_return_pct) pairs by calendar
+    month. Returns {"YYYY-MM": {"n": trades, "net": summed %}} sorted by month.
+    Rows with unparseable dates are skipped, not guessed."""
+    buckets: dict[str, dict] = defaultdict(lambda: {"n": 0, "net": 0.0})
+    for ts, ret in dated_returns:
+        if not isinstance(ts, str) or len(ts) < 7:
+            continue
+        month = ts[:7]
+        if not (month[:4].isdigit() and month[5:7].isdigit() and month[4] == "-"):
+            continue
+        buckets[month]["n"] += 1
+        buckets[month]["net"] += ret
+    return dict(sorted(buckets.items()))
+
+
 def summarize(returns: Sequence[float]) -> dict:
     """Bundle the headline risk metrics for a return series."""
     ci = mean_ci95(returns)
@@ -91,6 +168,9 @@ def summarize(returns: Sequence[float]) -> dict:
         "ci95_lo": ci[0] if ci else None,
         "ci95_hi": ci[1] if ci else None,
         "edge_distinguishable_from_noise": bool(ci and (ci[0] > 0 or ci[1] < 0)),
+        "profit_factor": profit_factor(returns),
+        "max_drawdown": max_drawdown(returns),
+        "recovery_factor": recovery_factor(returns),
     }
 
 

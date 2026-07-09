@@ -285,24 +285,29 @@ def _resolve_token(symbol: str):
 
 
 def _fetch_angel_by_token(exchange: str, token: str, period: str, interval: str,
-                           label: str) -> pd.DataFrame:
+                           label: str, *,
+                           start: datetime | None = None,
+                           end: datetime | None = None) -> pd.DataFrame:
     """
     Lower-level Angel fetch by explicit token + exchange.
     Used for indices (which aren't in the standard SYMBOL-EQ format).
+    Explicit start/end override the period-derived window (paged backfill).
     """
     angel_interval = ANGEL_INTERVALS.get(interval)
     if not angel_interval:
         raise ValueError(f"Interval '{interval}' not supported by Angel One. "
                          f"Supported: {', '.join(ANGEL_INTERVALS)}")
-    days = PERIOD_DAYS.get(period, 180)
 
     now = datetime.now(IST)
+    if start is None:
+        start = now - timedelta(days=PERIOD_DAYS.get(period, 180))
+    end = end or now
     params = {
         "exchange": exchange,
         "symboltoken": token,
         "interval": angel_interval,
-        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
-        "todate": now.strftime("%Y-%m-%d %H:%M"),
+        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+        "todate": end.strftime("%Y-%m-%d %H:%M"),
     }
 
     resp = _get_candle_data(params, label)
@@ -402,6 +407,27 @@ def get_provider_name() -> str:
     return "Angel One" if os.getenv("ANGEL_API_KEY") else "Yahoo Finance (delayed)"
 
 
+def _fetch_routed(symbol: str, period: str, interval: str) -> tuple[pd.DataFrame, str]:
+    """Provider routing (see fetch_data docstring). Returns (df, source)."""
+    from indices import get_index_info
+    idx_info = get_index_info(symbol)
+
+    if idx_info is not None:
+        if os.getenv("ANGEL_API_KEY"):
+            try:
+                return fetch_angel_index(symbol, period, interval), "angel"
+            except Exception as e:
+                logger.warning(
+                    "Angel index fetch failed for %s (%s) — falling back to yfinance",
+                    symbol, e,
+                )
+        return fetch_yfinance(idx_info["yf"], period, interval), "yfinance"
+
+    if os.getenv("ANGEL_API_KEY"):
+        return fetch_angel(symbol, period, interval), "angel"
+    return fetch_yfinance(symbol, period, interval), "yfinance"
+
+
 def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """
     Fetch OHLCV. Routes:
@@ -409,21 +435,67 @@ def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.Dat
     - Stocks → Angel by SYMBOL-EQ lookup; NO yfinance fallback when Angel is
       configured (see module docstring — delayed data must not silently feed
       intraday signals). yfinance is used only when Angel creds are absent.
+
+    Every successful fetch is appended to the local candle archive
+    (data_archive) — provider history caps make candles perishable; the
+    archive makes them compound. The write is fire-and-forget: it can never
+    fail the fetch, and ARCHIVE_DISABLED=true turns it off.
     """
+    df, source = _fetch_routed(symbol, period, interval)
+    try:
+        import data_archive
+        data_archive.archive_fetch(symbol, interval, df, source)
+    except Exception as e:
+        logger.debug("candle archive skipped for %s: %s", symbol, e)
+    return df
+
+
+def fetch_range(symbol: str, start: datetime, end: datetime,
+                interval: str = "5m") -> pd.DataFrame:
+    """
+    Explicit-window OHLCV fetch for paged backfills (data_archive CLI).
+    Same routing rules as fetch_data; naive start/end are taken as IST.
+    yfinance path is subject to its own history caps regardless of window.
+    """
+    start = IST.localize(start) if start.tzinfo is None else start.astimezone(IST)
+    end = IST.localize(end) if end.tzinfo is None else end.astimezone(IST)
+
     from indices import get_index_info
     idx_info = get_index_info(symbol)
 
     if idx_info is not None:
         if os.getenv("ANGEL_API_KEY"):
             try:
-                return fetch_angel_index(symbol, period, interval)
+                return _fetch_angel_by_token(
+                    exchange=idx_info["angel_exchange"],
+                    token=idx_info["angel_token"],
+                    period="", interval=interval, label=idx_info["display"],
+                    start=start, end=end,
+                )
             except Exception as e:
                 logger.warning(
-                    "Angel index fetch failed for %s (%s) — falling back to yfinance",
+                    "Angel index range fetch failed for %s (%s) — yfinance fallback",
                     symbol, e,
                 )
-        return fetch_yfinance(idx_info["yf"], period, interval)
+        return _fetch_yfinance_range(idx_info["yf"], start, end, interval)
 
     if os.getenv("ANGEL_API_KEY"):
-        return fetch_angel(symbol, period, interval)
-    return fetch_yfinance(symbol, period, interval)
+        token, exch, _ = _resolve_token(symbol)
+        df = _fetch_angel_by_token(exch, token, "", interval, symbol,
+                                   start=start, end=end)
+        _warn_unadjusted_split(df, symbol, ANGEL_INTERVALS.get(interval, ""))
+        return df
+    return _fetch_yfinance_range(symbol, start, end, interval)
+
+
+def _fetch_yfinance_range(symbol: str, start: datetime, end: datetime,
+                          interval: str) -> pd.DataFrame:
+    import yfinance as yf
+    df = yf.Ticker(symbol).history(
+        start=start, end=end, interval=interval,
+        auto_adjust=True, actions=False,
+    )
+    if df.empty:
+        raise ValueError(f"No yfinance data for {symbol} in "
+                         f"{start.date()}–{end.date()}")
+    return df

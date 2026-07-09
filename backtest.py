@@ -36,7 +36,35 @@ from scanner_setups import detect_setup_a, detect_setup_b, detect_setup_c, Signa
 import universe  # noqa: E402
 from universe import TIER1_WATCHLIST  # noqa: E402
 import eod_report  # noqa: E402
+from config import CONFIG  # noqa: E402
 from eod_report import COST_PER_TRADE_PCT  # noqa: E402
+
+# Cost model (Phase 2): "flat" (default) reproduces the historical constant
+# exactly; "statutory" itemizes real Indian charges per trade via
+# engines/execution. Selected by CONFIG.costs.model or the --cost-model flag.
+COST_MODEL_OVERRIDE: str | None = None
+
+
+def _cost_model() -> str:
+    return COST_MODEL_OVERRIDE or CONFIG.costs.model
+
+
+def _trade_cost_pct(t: "Trade") -> float:
+    """Round-trip cost %% for one simulated trade. Backtest trades are all
+    intraday product. Falls back to flat on any error — the cost model must
+    never abort a backtest."""
+    if _cost_model() == "flat":
+        return COST_PER_TRADE_PCT
+    try:
+        from engines.execution import round_trip_cost_pct
+        return round_trip_cost_pct(t.entry, t.exit_price, product="intraday")
+    except Exception:
+        return COST_PER_TRADE_PCT
+
+
+def _cost_label() -> str:
+    return (f"{COST_PER_TRADE_PCT}%" if _cost_model() == "flat"
+            else "itemized statutory")
 from constants import IST  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -102,7 +130,10 @@ class BacktestStats:
 
     @property
     def net_pnl_avg(self) -> float:
-        return self.gross_pnl_avg - COST_PER_TRADE_PCT
+        if not self.trades:
+            return self.gross_pnl_avg - COST_PER_TRADE_PCT
+        nr = self.net_returns
+        return sum(nr) / len(nr)
 
     @property
     def net_pnl_total(self) -> float:
@@ -112,7 +143,7 @@ class BacktestStats:
     def net_returns(self) -> list[float]:
         """Per-trade NET % returns (gross minus round-trip costs) — the series
         risk metrics operate on."""
-        return [t.pnl_gross_pct - COST_PER_TRADE_PCT for t in self.trades]
+        return [t.pnl_gross_pct - _trade_cost_pct(t) for t in self.trades]
 
     @property
     def avg_win(self) -> float:
@@ -138,7 +169,7 @@ class BacktestStats:
         peak = 0.0
         max_dd = 0.0
         for t in sorted(self.trades, key=lambda x: x.entry_time):
-            equity += t.pnl_gross_pct - COST_PER_TRADE_PCT
+            equity += t.pnl_gross_pct - _trade_cost_pct(t)
             peak = max(peak, equity)
             dd = peak - equity
             max_dd = max(max_dd, dd)
@@ -196,11 +227,31 @@ def _period_str(days: int) -> str:
     return f"{days}d" if days <= 60 else f"{(days + 29) // 30}mo"
 
 
+# --local mode: replay from the frozen data_archive store instead of live
+# provider fetches — reproducible inputs, and no ~60d provider cap once the
+# archive has accumulated/backfilled history.
+_LOCAL_ARCHIVE = False
+
+
+def set_local_mode(on: bool) -> None:
+    global _LOCAL_ARCHIVE
+    _LOCAL_ARCHIVE = bool(on)
+
+
 def _fetch_5m(symbol: str, days: int) -> tuple[str, pd.DataFrame]:
     """Normalize symbol, fetch 5m history, IST-localize. Returns (sym, df)."""
     sym = symbol.upper().strip()
     if "." not in sym:
         sym = f"{sym}.NS"
+    if _LOCAL_ARCHIVE:
+        import data_archive
+        df = data_archive.load(
+            sym, "5m", start=datetime.now(IST) - timedelta(days=days))
+        if not len(df):
+            logger.warning(
+                "%s: nothing in the local archive — seed it with "
+                "`python data_archive.py backfill` (symbol skipped).", sym)
+        return sym, _normalize_ist(df) if len(df) else df
     df = fetch_data(sym, period=_period_str(days), interval="5m")
     df = _normalize_ist(df)
     # MEDIUM-7: requested vs actual coverage. Intraday history is provider-
@@ -449,7 +500,7 @@ def _sim_param(df: pd.DataFrame, sym: str, param, score_mode: bool,
 def _mean_net(trades: list[Trade]) -> float:
     if not trades:
         return float("-inf")          # a param that never trades can't be "best"
-    return sum(t.pnl_gross_pct - COST_PER_TRADE_PCT for t in trades) / len(trades)
+    return sum(t.pnl_gross_pct - _trade_cost_pct(t) for t in trades) / len(trades)
 
 
 # Default parameter grids searched per training window.
@@ -529,7 +580,7 @@ def walk_forward(symbols: Iterable[str], days: int = 120,
             "fold": f, "param": best_param,
             "train_metric": best_metric,
             "test_trades": len(test_tr),
-            "test_net": sum(t.pnl_gross_pct - COST_PER_TRADE_PCT for t in test_tr),
+            "test_net": sum(t.pnl_gross_pct - _trade_cost_pct(t) for t in test_tr),
         })
 
     return {
@@ -545,7 +596,7 @@ def format_walkforward(res: dict | None, score_mode: bool) -> str:
                 "run (need several folds of intraday history) ===\n")
 
     oos = res["oos_trades"]
-    returns = [t.pnl_gross_pct - COST_PER_TRADE_PCT for t in oos]
+    returns = [t.pnl_gross_pct - _trade_cost_pct(t) for t in oos]
     n = len(oos)
     wins = sum(1 for t in oos if t.pnl_gross_pct > 0)
     net = sum(returns)
@@ -613,7 +664,7 @@ def format_stats(stats: BacktestStats) -> str:
         f"Trades:           {stats.n}",
         f"Hit rate:         {stats.hit_rate:.1f}%  ({stats.wins} wins / {stats.losses} losses / {stats.break_even} BE)",
         f"Avg gross P&L:    {stats.gross_pnl_avg:+.3f}% per trade",
-        f"Net (after {COST_PER_TRADE_PCT}% costs): {stats.net_pnl_avg:+.3f}% per trade",
+        f"Net (after {_cost_label()} costs): {stats.net_pnl_avg:+.3f}% per trade",
         f"Total net P&L:    {stats.net_pnl_total:+.2f}% over {stats.n} trades",
         f"Avg win:          {stats.avg_win:+.2f}%",
         f"Avg loss:         {stats.avg_loss:+.2f}%",
@@ -680,7 +731,7 @@ def format_summary(all_stats: list[BacktestStats]) -> str:
         f"Total trades:     {total_trades}",
         f"Hit rate:         {(total_wins / total_trades * 100):.1f}%",
         f"Total gross P&L:  {total_gross:+.2f}%",
-        f"Total net P&L:    {total_net:+.2f}%  (after {COST_PER_TRADE_PCT}%/trade costs)",
+        f"Total net P&L:    {total_net:+.2f}%  (after {_cost_label()}/trade costs)",
         f"Avg net per trade: {(total_net / total_trades):+.3f}%",
         riskmetrics.format_line(all_returns, "Risk-adj"),
         bench_line,
@@ -732,13 +783,26 @@ def _cli():
                         help="Override ATR lower bound (default 0.004 = 0.4%%)")
     parser.add_argument("--atr-hi", type=float, default=None,
                         help="Override ATR upper bound (default 0.015 = 1.5%%)")
+    parser.add_argument("--local", action="store_true",
+                        help="Replay from the local candle archive "
+                             "(data_archive.py) instead of live fetches — "
+                             "reproducible, no provider history cap")
+    parser.add_argument("--cost-model", choices=["flat", "statutory"], default=None,
+                        help="Cost model: flat 0.13%%/trade (default) or itemized "
+                             "statutory Indian charges (engines/execution)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
+    if args.local:
+        set_local_mode(True)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.cost_model:
+        global COST_MODEL_OVERRIDE
+        COST_MODEL_OVERRIDE = args.cost_model
 
     if args.watchlist:
         symbols = TIER1_WATCHLIST

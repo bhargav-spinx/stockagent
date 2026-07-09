@@ -26,6 +26,8 @@ logs/
 
 # Runtime SQLite (subscribers, fired-signal dedup) — per-deployment state
 stockagent.db
+# Local OHLCV candle archive (data_archive.py) — grows daily, never commit
+market_data.db
 *.db-journal
 *.db-wal
 *.db-shm

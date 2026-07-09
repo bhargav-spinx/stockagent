@@ -15,6 +15,7 @@ lean install omits — so skip there; runs locally.
 """
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -32,8 +33,12 @@ def test_session_path_is_absolute_and_pinned_to_module_dir():
     # and silently create an unauthorized session on restart.
     assert os.path.isabs(tl.SESSION_NAME), tl.SESSION_NAME
     assert os.path.basename(tl.SESSION_NAME) == "telethon_session"
-    expected_dir = os.path.dirname(os.path.abspath(tl.__file__))
-    assert os.path.dirname(tl.SESSION_NAME) == expected_dir
+    # Compare CANONICALLY: SESSION_NAME is built with Path(__file__).resolve(),
+    # so the expectation must resolve too. A raw os.path.abspath() compare
+    # flakes on Windows (drive-letter case / 8.3 short names / separators
+    # differ between abspath and resolve), independent of CWD.
+    expected_dir = Path(tl.__file__).resolve().parent
+    assert Path(tl.SESSION_NAME).resolve().parent == expected_dir
 
 
 def test_register_channel_registers_a_newmessage_handler():
