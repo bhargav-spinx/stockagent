@@ -1089,6 +1089,23 @@ async def _autoscan_tick(app: Application) -> None:
         except Exception as e:
             logger.warning("autoscan: phase3 features for %s skipped: %s", c.symbol, e)
 
+        snapshot = _merge_features(
+            _safe_features(features_from_scorecard, c, idx_trend=idx),
+            regime_feats,
+            p3_feats,
+        )
+        # Shadow mode (Phase 4, read-only): when a trained artifact exists,
+        # log its P(win) as a FEATURE — never printed, never gating — so a
+        # live (predicted, realized) calibration record accrues while the
+        # model remains research.
+        if snapshot:
+            try:
+                import shadow
+                snapshot = _merge_features(
+                    snapshot, shadow.shadow_probability(snapshot))
+            except Exception as e:
+                logger.warning("autoscan: shadow probability skipped: %s", e)
+
         # Log once (system-level alert; not per-user — outcome is identical)
         subscriptions.log_alert(
             category="scan",
@@ -1101,11 +1118,7 @@ async def _autoscan_tick(app: Application) -> None:
             target1=c.target1,
             target2=c.target2,
             score=float(c.score),
-            features=_merge_features(
-                _safe_features(features_from_scorecard, c, idx_trend=idx),
-                regime_feats,
-                p3_feats,
-            ),
+            features=snapshot,
         )
 
         msg = "🔔 *Auto-Signal* — Strong Candidate\n\n" + intraday_score.format_scorecard(c)

@@ -256,10 +256,14 @@ def _cli() -> None:
         if not rows:
             print("Archive is empty — run a backfill or let the bot fetch.")
             return
-        for r in rows:
-            print(f"{r['symbol']:<16} {r['interval']:<4} "
-                  f"{r['first']:%Y-%m-%d} → {r['last']:%Y-%m-%d}  "
-                  f"({r['rows']} candles)")
+        try:
+            for r in rows:
+                print(f"{r['symbol']:<16} {r['interval']:<4} "
+                      f"{r['first']:%Y-%m-%d} → {r['last']:%Y-%m-%d}  "
+                      f"({r['rows']} candles)")
+        except BrokenPipeError:
+            # `coverage | head` closes the pipe mid-print — normal, not an error.
+            sys.stderr.close()
         return
 
     import os

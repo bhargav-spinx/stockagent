@@ -37,6 +37,10 @@ market_data.db
 # Point-in-time universe snapshots (per-deployment runtime data)
 universe_snapshots/
 
+# Trained model artifacts (per-machine research output; a gate-passing model
+# becomes a deliberate release decision, not an accidental commit)
+models/
+
 # IDE / OS
 .claude/
 .vscode/

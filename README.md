@@ -195,6 +195,10 @@ stockagent/
 ├── riskmetrics.py         # Sharpe/Sortino/t-stat/CI (stdlib-only)
 ├── narrative.py           # Deterministic institutional write-ups (no LLM)
 ├── backtest.py            # Walk-forward backtest harness
+├── sim_dataset.py         # Replay archive through live engines → labeled training rows
+├── prob_model.py          # L2 logistic regression (numpy IRLS, JSON artifacts)
+├── prob_eval.py           # Purged walk-forward CV + calibration + ship gates
+├── shadow.py              # Shadow-mode P(win) — logged as a feature, never shown
 ├── tip_parser.py          # Tip extraction from text/OCR
 ├── telethon_listener.py   # Public-channel tip monitor (user account)
 ├── auth_once.py           # One-time Telethon OTP authentication
@@ -236,6 +240,19 @@ Analysis is organized as **independent engines** (`engines/`) that each return s
 - **Position sizing & daily risk budget** — set `risk.capital` (₹) in a `STOCKAGENT_CONFIG` overrides file to get fixed-fractional position sizes on alerts and a hypothetical-exposure section in the EOD report; set `risk.max_daily_risk_r` to stop signaling after that many R lost in a day.
 - **Statutory cost model** — `costs.model: "statutory"` (or `backtest.py --cost-model statutory`) replaces the flat 0.13%/round-trip estimate with itemized brokerage, STT, exchange, SEBI, stamp duty, GST and a separate slippage estimate; swing outcomes use delivery rates (higher STT/stamp), which the flat estimate understates.
 - **Probabilities are still never printed** — `TradeEvidence.probability_*` stays `None` until a calibrated, walk-forward-validated model exists (Phase 4 gate).
+
+## Probability engine (Phase 4 — shadow mode)
+
+The probability pipeline exists but its output is **deliberately invisible** until it earns visibility:
+
+```bash
+python sim_dataset.py generate --universe tier1     # archive → labeled training rows
+python sim_dataset.py stats
+python prob_eval.py evaluate                        # purged walk-forward + calibration
+python prob_eval.py train --out models/prob_v1.json # JSON artifact (shadow mode)
+```
+
+`sim_dataset.py` replays archived 5-min candles through the *same* score engine, entry window, levels and resolver the live bot uses, producing (decision-time features → outcome) rows at scale — with the honesty caveats recorded in every row (simulated fills are optimistic; external context can't be reconstructed point-in-time). `prob_eval.py` is the referee: purged/embargoed walk-forward CV, reliability tables, Brier skill, and hard ship-gates — the model must be **calibrated**, must **discriminate**, must **beat the 100-point score's ranking out-of-sample by a margin**, and must be **adequately powered**, or it stays research. When an artifact exists, `shadow.py` logs its P(win) into each fired alert's feature snapshot — never into a message — so a live (predicted, realized) calibration record accrues. Printing a probability to a user requires all gates green **and** live shadow calibration agreeing with the simulation; "the model stays research" is an acceptable permanent outcome.
 
 ## Feature engines & the evaluation harness
 
