@@ -167,6 +167,49 @@ def test_daily_context_has_no_same_day_lookahead(temp_archive, monkeypatch):
         assert max(daily.index.date) < datetime(2025, 6, 4).date()
 
 
+def _seven_session_df() -> pd.DataFrame:
+    """7 sessions of the day-2 template at rising bases — enough history that
+    an unwindowed replay would hand the scorer >5 sessions."""
+    rows, idx = [], []
+    for s in range(7):
+        base = 500.0 + 8.0 * s
+        day = datetime(2025, 6, 2) + timedelta(days=s if s < 4 else s + 2)  # skip weekend
+        for i, ts in enumerate(_session_ts(day, 75)):
+            o = base + 0.10 * i + 0.6 * math.sin(i / 4)
+            c = o + 0.08 + 0.9 * math.sin(i * 1.3)
+            hi = max(o, c) + 1.1
+            lo = min(o, c) - 1.1
+            v = 120_000 + 2_000 * i + (60_000 if i % 11 == 0 else 0)
+            rows.append((o, hi, lo, c, v)); idx.append(ts)
+    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close", "Volume"],
+                        index=pd.DatetimeIndex(idx))
+
+
+def test_scorer_never_sees_more_than_live_window(temp_archive, monkeypatch):
+    """FIDELITY PIN: live alerts are computed over a period='5d' fetch, so the
+    replay must feed score_stock ≤ LIVE_WINDOW_SESSIONS sessions ending at the
+    replayed day — a wider frame would train on features (RVOL baselines etc.)
+    that live inference can never reproduce."""
+    data_archive.store_dataframe("WIDE.NS", "5m", _seven_session_df(),
+                                 source="test")
+    captured: list = []
+    orig = intraday_score.score_stock
+
+    def spy(df, sym, **kw):
+        captured.append(df)
+        return orig(df, sym, **kw)
+
+    monkeypatch.setattr(sim_dataset.intraday_score, "score_stock", spy)
+    sim_dataset.generate_symbol("WIDE.NS", min_score=0, run_id="win")
+    assert captured, "expected the replay to score candles"
+    for frame in captured:
+        dates = sorted(set(frame.index.date))
+        assert len(dates) <= sim_dataset.LIVE_WINDOW_SESSIONS
+    # and later replayed days really do use the LATEST window, not the head
+    last_frame_dates = sorted(set(captured[-1].index.date))
+    assert last_frame_dates[-1] >= datetime(2025, 6, 9).date()
+
+
 def test_load_rows_time_ordered_and_filters(temp_archive):
     sim_dataset.generate_symbol("SIM.NS", min_score=60, run_id="o")
     rows = sim_dataset.load_rows()

@@ -40,6 +40,7 @@ import json
 import logging
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -109,6 +110,15 @@ def _daily_before(daily: pd.DataFrame, d) -> pd.DataFrame | None:
     return sliced if len(sliced) else None
 
 
+# The live scan fetches period="5d" — every live feature (RVOL baseline, gap,
+# volume curve) is computed over ≈5 sessions of context. The replay MUST feed
+# the scorer the same frame shape, or train/serve feature distributions drift
+# (a 23-prior-session RVOL baseline is a different variable than a 4-session
+# one). This window is also what makes generation fast: per-call cost is
+# bounded by ~5 sessions, not the whole archive.
+LIVE_WINDOW_SESSIONS = 5
+
+
 def generate_symbol(symbol: str, *, min_score: int = 60,
                     days: int | None = None,
                     index_df: pd.DataFrame | None = None,
@@ -123,58 +133,66 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
     daily = data_archive.load(symbol, "1d")
 
     sessions = sorted(set(df.index.date))
-    if days:
-        sessions = sessions[-days:]
-    allowed = set(sessions)
+    replay = sessions[-days:] if days else sessions
+    date_arr = df.index.date
 
     rows: list[tuple] = []
-    fired_days: set = set()
-    for i in range(MIN_WARMUP_CANDLES, len(df)):
-        ts = df.index[i].to_pydatetime()
-        d = ts.date()
-        if d not in allowed or d in fired_days:
-            continue
-        if not is_intraday_entry_window(ts):
-            continue
-        slice_df = df.iloc[: i + 1]
-        try:
-            card = intraday_score.score_stock(
-                slice_df, symbol, skip_external=True,
-                daily_df=_daily_before(daily, d))
-        except Exception as e:
-            logger.debug("%s @ %s: score failed: %s", symbol, ts, e)
-            continue
-        if card.direction == "none" or card.score < min_score:
-            continue
+    for d in replay:
+        k = sessions.index(d)
+        if k == 0:
+            continue                      # no prior session → no gap/RVOL
+        w_start = sessions[max(0, k - (LIVE_WINDOW_SESSIONS - 1))]
+        window = df[(date_arr >= w_start) & (date_arr <= d)]
+        day_pos = [j for j, dd in enumerate(window.index.date) if dd == d]
+        daily_ctx = _daily_before(daily, d)
 
-        fired_days.add(d)
-        alert = {"symbol": symbol, "entry": card.entry,
-                 "stop_loss": card.stop_loss, "target1": card.target1,
-                 "target2": card.target2, "direction": card.direction,
-                 "generated_at": ts}
-        outcome = eod_report.resolve_intraday(alert, df=df)
-        status = (outcome or {}).get("status")
-        if status in (None, "open", "no_data"):
-            continue
+        for j in day_pos:
+            if j + 1 <= MIN_WARMUP_CANDLES:
+                continue
+            ts = window.index[j].to_pydatetime()
+            if not is_intraday_entry_window(ts):
+                continue
+            slice_df = window.iloc[: j + 1]
+            try:
+                card = intraday_score.score_stock(
+                    slice_df, symbol, skip_external=True, daily_df=daily_ctx)
+            except Exception as e:
+                logger.debug("%s @ %s: score failed: %s", symbol, ts, e)
+                continue
+            if card.direction == "none" or card.score < min_score:
+                continue
 
-        feats = features_from_scorecard(card, now=ts)
-        idx_slice = (index_df[index_df.index <= df.index[i]]
-                     if index_df is not None and len(index_df) else None)
-        feats.update(phase3_features(slice_df, index_df=idx_slice))
-        feats["sim"] = 1
+            # Day qualifies — mirror live one-per-day semantics whether or not
+            # the outcome resolves (open/no_data days are consumed, not retried
+            # at a later candle the live bot would never have seen).
+            alert = {"symbol": symbol, "entry": card.entry,
+                     "stop_loss": card.stop_loss, "target1": card.target1,
+                     "target2": card.target2, "direction": card.direction,
+                     "generated_at": ts}
+            outcome = eod_report.resolve_intraday(alert, df=window)
+            status = (outcome or {}).get("status")
+            if status in (None, "open", "no_data"):
+                break
 
-        pnl = outcome.get("pnl_pct")
-        rows.append((
-            symbol, ts.isoformat(), d.isoformat(), card.direction,
-            int(card.score), card.entry, card.stop_loss, card.target1,
-            card.target2, status, pnl,
-            outcome.get("mfe_pct"), outcome.get("mae_pct"),
-            outcome.get("duration_min"),
-            _r_multiple(card.entry, card.stop_loss, pnl),
-            int(status in _PASS), int(status in _PASS or status in _FAIL),
-            json.dumps(feats, sort_keys=True, default=str),
-            DATASET_VERSION, run_id,
-        ))
+            feats = features_from_scorecard(card, now=ts)
+            idx_slice = (index_df[index_df.index <= window.index[j]]
+                         if index_df is not None and len(index_df) else None)
+            feats.update(phase3_features(slice_df, index_df=idx_slice))
+            feats["sim"] = 1
+
+            pnl = outcome.get("pnl_pct")
+            rows.append((
+                symbol, ts.isoformat(), d.isoformat(), card.direction,
+                int(card.score), card.entry, card.stop_loss, card.target1,
+                card.target2, status, pnl,
+                outcome.get("mfe_pct"), outcome.get("mae_pct"),
+                outcome.get("duration_min"),
+                _r_multiple(card.entry, card.stop_loss, pnl),
+                int(status in _PASS), int(status in _PASS or status in _FAIL),
+                json.dumps(feats, sort_keys=True, default=str),
+                DATASET_VERSION, run_id,
+            ))
+            break                          # one trade per (symbol, session)
 
     if rows:
         with data_archive._conn() as c:
@@ -195,11 +213,17 @@ def generate(symbols: Iterable[str], *, min_score: int = 60,
         index_df = None
         logger.info("no archived NIFTY 5m — relative-strength features omitted")
     total, per_symbol = 0, {}
-    for sym in symbols:
+    symbols = list(symbols)
+    t0 = time.monotonic()
+    for i, sym in enumerate(symbols, 1):
+        t_sym = time.monotonic()
         n = generate_symbol(sym, min_score=min_score, days=days,
                             index_df=index_df, run_id=run_id)
         per_symbol[sym] = n
         total += n
+        logger.info("[%d/%d] %s: %d rows (%.1fs, %d total)",
+                    i, len(symbols), sym, n, time.monotonic() - t_sym, total)
+    logger.info("generate done: %d rows in %.0fs", total, time.monotonic() - t0)
     return {"run_id": run_id, "rows": total, "symbols": per_symbol}
 
 
