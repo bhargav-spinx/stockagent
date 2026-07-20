@@ -137,6 +137,7 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
     date_arr = df.index.date
 
     rows: list[tuple] = []
+    score_errors = 0
     for d in replay:
         k = sessions.index(d)
         if k == 0:
@@ -157,7 +158,14 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
                 card = intraday_score.score_stock(
                     slice_df, symbol, skip_external=True, daily_df=daily_ctx)
             except Exception as e:
-                logger.debug("%s @ %s: score failed: %s", symbol, ts, e)
+                # NEVER swallow these at DEBUG: a systematic scoring crash
+                # (e.g. the pd.NA/VWAP bug) once produced "0 rows" across 190
+                # symbols while looking like a calm, successful run.
+                score_errors += 1
+                if score_errors == 1:
+                    logger.warning(
+                        "%s: score_stock failed at %s (%s: %s) — counting the "
+                        "rest", symbol, ts, type(e).__name__, e)
                 continue
             if card.direction == "none" or card.score < min_score:
                 continue
@@ -194,6 +202,9 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
             ))
             break                          # one trade per (symbol, session)
 
+    if score_errors:
+        logger.warning("%s: %d candle(s) failed to score — dataset for this "
+                       "symbol is INCOMPLETE", symbol, score_errors)
     if rows:
         with data_archive._conn() as c:
             c.executemany(

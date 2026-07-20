@@ -30,7 +30,14 @@ def vwap(df: pd.DataFrame) -> pd.Series:
     by_date = df.index.date
     cum_pv = (typical * vol).groupby(by_date).cumsum()
     cum_v = vol.groupby(by_date).cumsum()
-    return (cum_pv / cum_v.replace(0, pd.NA)).astype(float)
+    # Zero cumulative volume (a session opening with no-trade bars — common in
+    # real archived data) must become NaN, NOT pd.NA: pd.NA poisons the series
+    # into object dtype and pandas 3 then raises
+    # "float() argument must be ... not 'NAType'" out of .astype(float).
+    # That crash took down every score_stock call on archived candles and,
+    # latently, any live scan of a symbol whose session opened untraded.
+    # .where keeps the series float end-to-end; NaN divides propagate cleanly.
+    return (cum_pv / cum_v.where(cum_v != 0)).astype(float)
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
