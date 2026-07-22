@@ -92,6 +92,30 @@ def _merge_features(*dicts: dict | None) -> dict | None:
     return merged or None
 
 
+async def _send_md(bot, chat_id: int, text: str, label: str = "push") -> bool:
+    """Broadcast with a plain-text fallback: content beats formatting.
+
+    A single unbalanced Markdown entity (an unescaped * or _ in a Marketaux
+    headline, channel text, etc.) makes Telegram reject the ENTIRE message —
+    on 2026-07-22 two of three scan alerts were journaled but never delivered
+    this way, visible only as EOD-report rows the user never received. If the
+    Markdown send fails for ANY reason, retry unformatted; only a double
+    failure is a real delivery failure (logged as ERROR). Returns True iff
+    the user actually received something."""
+    try:
+        await bot.send_message(chat_id, text, parse_mode="Markdown")
+        return True
+    except Exception as e:
+        logger.warning("%s: Markdown send to %s failed (%s: %s) — retrying "
+                       "as plain text", label, chat_id, type(e).__name__, e)
+    try:
+        await bot.send_message(chat_id, text)
+        return True
+    except Exception as e:
+        logger.error("%s: send to %s failed outright: %s", label, chat_id, e)
+        return False
+
+
 # ---------- Access control (personal-use allowlist) ----------
 # This bot gives BUY/SELL/target calls. Distributing those to others can bring it
 # under SEBI Research Analyst scope; leaving it open also invites resource abuse.
@@ -1149,11 +1173,8 @@ async def _autoscan_tick(app: Application) -> None:
             logger.warning("autoscan: news enrich for %s failed: %s", c.symbol, e)
         delivered = 0
         for uid in subs:
-            try:
-                await app.bot.send_message(uid, msg, parse_mode="Markdown")
+            if await _send_md(app.bot, uid, msg, label="autoscan"):
                 delivered += 1
-            except Exception as e:
-                logger.warning("autoscan: send to %s failed: %s", uid, e)
         # The daily cap is a RISK cap — it should count signals the user could
         # actually act on. An alert Telegram failed to deliver to anyone must
         # not consume the budget. (Dedup + journal above stay marked either
@@ -1261,10 +1282,7 @@ async def _quiet_digest_tick(app: Application) -> None:
     subscriptions.mark_fired(key)
     msg = _format_quiet_digest()
     for uid in subs:
-        try:
-            await app.bot.send_message(uid, msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning("quiet digest send to %s failed: %s", uid, e)
+        await _send_md(app.bot, uid, msg, label="quiet digest")
     logger.info("quiet digest sent to %d subscriber(s)", len(subs))
 
 
@@ -1706,18 +1724,15 @@ async def _swing_alert_tick(app: Application) -> None:
             # minutes and stays within budget.
             watchlist = list(INTRADAY_UNIVERSE)
             used_universe = True
-            try:
-                await app.bot.send_message(
-                    uid,
-                    f"🌅 *End-of-Day Swing Run*\n\n"
-                    f"Watchlist empty — scanning the "
-                    f"{len(watchlist)} liquid F&O stocks, "
-                    f"sending the top {SWING_MAX_ALERTS} by confidence.\n"
-                    "Add stocks via `/watch SYMBOL` to scan only those.",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logger.warning("swing intro send to %s failed: %s", uid, e)
+            await _send_md(
+                app.bot, uid,
+                f"🌅 *End-of-Day Swing Run*\n\n"
+                f"Watchlist empty — scanning the "
+                f"{len(watchlist)} liquid F&O stocks, "
+                f"sending the top {SWING_MAX_ALERTS} by confidence.\n"
+                "Add stocks via `/watch SYMBOL` to scan only those.",
+                label="swing intro",
+            )
 
         # Phase 1 — analyze the whole watchlist, collecting actionable signals.
         # Sending is deferred so we can rank by confidence and cap the volume
@@ -1772,11 +1787,8 @@ async def _swing_alert_tick(app: Application) -> None:
                 f"{int(result.get('confidence', 0))}% confidence\n\n"
                 + format_report(result)
             )
-            try:
-                await app.bot.send_message(uid, msg, parse_mode="Markdown")
+            if await _send_md(app.bot, uid, msg, label="swing signal"):
                 sent += 1
-            except Exception as e:
-                logger.warning("swing signal send to %s failed: %s", uid, e)
 
         # Summary so the user knows the run completed, even with no signals.
         try:
@@ -1937,7 +1949,7 @@ async def _eod_report_tick(app: Application) -> None:
                 asyncio.to_thread(
                     eod_report.build_report, uid, None, rejection_snapshot),
                 timeout=600)
-            await app.bot.send_message(uid, report, parse_mode="Markdown")
+            await _send_md(app.bot, uid, report, label="EOD report")
         except asyncio.TimeoutError:
             logger.error("EOD report for %s timed out (600s) — data feed slow", uid)
         except Exception as e:
@@ -2013,8 +2025,9 @@ async def _swing_outcome_tick(app: Application) -> None:
             history = await asyncio.to_thread(subscriptions.get_resolved_alerts, cats, uid)
             summary = eod_report.swing_record_summary(history)
             msg = eod_report.format_swing_completion(rec, summary)
-            await app.bot.send_message(uid, msg, parse_mode="Markdown")
-            subscriptions.mark_outcome_notified(rec["id"])  # only after a successful send
+            if await _send_md(app.bot, uid, msg, label="swing outcome"):
+                # only after the user actually received it (either formatting)
+                subscriptions.mark_outcome_notified(rec["id"])
         except Exception as e:
             logger.warning("swing outcome send to %s failed: %s", uid, e)
 
@@ -2093,10 +2106,7 @@ async def _heartbeat_tick(app: Application) -> None:
                 + ("Restart the service to recover the dead loop(s)."
                    if dead_tasks else "I'll keep retrying."))
         for uid in recipients:
-            try:
-                await app.bot.send_message(uid, warn, parse_mode="Markdown")
-            except Exception as e:
-                logger.warning("heartbeat: warn send to %s failed: %s", uid, e)
+            await _send_md(app.bot, uid, warn, label="heartbeat warn")
 
 
 async def _heartbeat_loop(app: Application) -> None:
