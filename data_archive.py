@@ -37,9 +37,20 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pandas as pd
+# Load .env + install the corp-TLS workaround BEFORE data_provider is used, so
+# the backfill CLI actually sees ANGEL_* creds and can reach Angel. Without
+# this the CLI read only the OS environment, silently fell back to yfinance
+# even when Angel was configured (a train/serve fidelity trap), and would have
+# failed Angel's TLS on a TLS-inspecting network. Matches sim_dataset.py /
+# backtest.py, which already do this.
+from dotenv import load_dotenv
+load_dotenv()
+import ssl_dev  # noqa: E402
+ssl_dev.install_if_enabled()
 
-from constants import IST
+import pandas as pd  # noqa: E402
+
+from constants import IST  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +60,11 @@ ARCHIVE_DB_PATH = Path(__file__).parent / "market_data.db"
 # comfortably under every published cap. Daily pages far coarser.
 _CHUNK_DAYS_INTRADAY = 55
 _CHUNK_DAYS_DAILY = 365
-_BACKFILL_PACING_SEC = 0.6      # ~same headroom logic as scanner pacing
+# Angel's candle endpoint throttles clustered calls well below its nominal
+# 3 req/s; 0.6s spacing tripped "exceeding access rate" almost immediately on
+# a 14-symbol run. 1.2s keeps a steadier cadence, and backfill_symbol adds
+# exponential-backoff retry on top for the bursts that still slip through.
+_BACKFILL_PACING_SEC = 1.2
 
 _COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -199,11 +214,29 @@ def archive_fetch(symbol: str, interval: str, df, source: str) -> None:
 # Backfill CLI
 # ---------------------------------------------------------------------------
 
+_RATE_LIMIT_MARKERS = ("access rate", "rate-limit", "rate limit", "too many")
+_BACKFILL_MAX_RETRIES = 4
+
+
+def _is_rate_limited(err: Exception) -> bool:
+    m = str(err).lower()
+    return any(marker in m for marker in _RATE_LIMIT_MARKERS)
+
+
 def backfill_symbol(symbol: str, days: int, interval: str = "5m",
-                    pacing_sec: float = _BACKFILL_PACING_SEC) -> int:
+                    pacing_sec: float = _BACKFILL_PACING_SEC,
+                    max_retries: int = _BACKFILL_MAX_RETRIES) -> int:
     """Page an explicit-window fetch backwards over `days` and store every
-    chunk. Returns total rows written. Chunks that fail are logged and
-    skipped — a rate-limited window must not abort the whole symbol."""
+    chunk. Returns total rows written.
+
+    Angel's candle endpoint throttles bursts hard ("exceeding access rate")
+    even under its nominal 3 req/s — clustered chunk calls get blocked while
+    spaced calls succeed. The live path deliberately does NOT retry a
+    rate-limit (it must not hammer a quota block mid-scan), but a BACKFILL is
+    not latency-sensitive, so here we back off exponentially and retry the
+    same chunk before giving up. Non-rate-limit errors (e.g. symbol not in the
+    scrip master) are logged and skipped without retry — retrying wouldn't
+    help and would just burn quota."""
     from data_provider import fetch_range
 
     chunk_days = _CHUNK_DAYS_DAILY if interval == "1d" else _CHUNK_DAYS_INTRADAY
@@ -212,12 +245,22 @@ def backfill_symbol(symbol: str, days: int, interval: str = "5m",
     total = 0
     while start < now:
         chunk_end = min(start + timedelta(days=chunk_days), now)
-        try:
-            df = fetch_range(symbol, start, chunk_end, interval=interval)
-            total += store_dataframe(symbol, interval, df, source="backfill")
-        except Exception as e:
-            logger.warning("backfill %s %s→%s: %s",
-                           symbol, start.date(), chunk_end.date(), e)
+        for attempt in range(max_retries + 1):
+            try:
+                df = fetch_range(symbol, start, chunk_end, interval=interval)
+                total += store_dataframe(symbol, interval, df, source="backfill")
+                break
+            except Exception as e:
+                if _is_rate_limited(e) and attempt < max_retries:
+                    wait = pacing_sec * (2 ** attempt) + 1.0   # 1.6, 2.2, 3.4, 5.8s…
+                    logger.info("backfill %s %s→%s rate-limited — backing off "
+                                "%.1fs (retry %d/%d)", symbol, start.date(),
+                                chunk_end.date(), wait, attempt + 1, max_retries)
+                    time_mod.sleep(wait)
+                    continue
+                logger.warning("backfill %s %s→%s: %s",
+                               symbol, start.date(), chunk_end.date(), e)
+                break
         start = chunk_end
         time_mod.sleep(pacing_sec)
     return total
