@@ -55,16 +55,39 @@ def sortino(returns: Sequence[float]) -> float | None:
     return _mean(returns) / dd
 
 
+# Two-sided 95% Student-t critical values t(0.975, df). Between listed df the
+# next LOWER df is used (slightly wider = conservative); ≥ 1000 → normal 1.96.
+_T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+         7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179,
+         13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101,
+         19: 2.093, 20: 2.086, 21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064,
+         25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+         40: 2.021, 60: 2.000, 120: 1.980, 1000: 1.962}
+
+
+def t_crit_975(df: int) -> float:
+    """t(0.975, df) from the table above (conservative between entries)."""
+    if df >= 1000:
+        return 1.96
+    return _T975[max(k for k in _T975 if k <= max(1, df))]
+
+
 def mean_ci95(returns: Sequence[float]) -> tuple[float, float] | None:
-    """95% CI on the mean per-trade return via normal approx (mean ± 1.96·SE).
+    """95% CI on the mean per-trade return: mean ± t(0.975, n−1)·SE.
     If the interval straddles 0, the mean return is not distinguishable from 0
-    at ~95% confidence — i.e. no demonstrable edge yet. None when <2 trades."""
+    at ~95% confidence — i.e. no demonstrable edge yet. None when <2 trades.
+
+    Student-t, not the normal 1.96: at the small n this bot actually has, z
+    overclaims — n=5 gave (0.06, 1.74) "distinguishable" where the correct
+    t(4) interval is (−0.29, 2.09). (Still assumes independent trades; same-day
+    rows across symbols are correlated, so even this is optimistic.)"""
     n = len(returns)
     if n < 2:
         return None
     se = _std(returns) / math.sqrt(n)
     m = _mean(returns)
-    return (m - 1.96 * se, m + 1.96 * se)
+    t = t_crit_975(n - 1)
+    return (m - t * se, m + t * se)
 
 
 def t_stat(returns: Sequence[float]) -> float | None:

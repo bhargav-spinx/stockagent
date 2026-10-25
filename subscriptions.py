@@ -7,12 +7,15 @@ Two tables:
   same trading day. Keyed by (symbol, setup, direction, trade_date).
 """
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, date, timezone
 from pathlib import Path
 
 from constants import IST
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "stockagent.db"
 
@@ -367,6 +370,30 @@ def log_raw_tip(
 
 # ---------- alerts log + outcomes ----------
 
+def normalize_direction(direction: str) -> str:
+    """'long'/'short' from either vocabulary (analyzer emits BUY/SELL)."""
+    d = str(direction or "").strip().lower()
+    if d in ("long", "buy"):
+        return "long"
+    if d in ("short", "sell"):
+        return "short"
+    raise ValueError(f"unknown trade direction {direction!r}")
+
+
+def levels_consistent(direction: str, entry: float, stop_loss: float,
+                      target1: float, target2: float) -> bool:
+    """SL < entry < T1 <= T2 for a long (mirror for a short). Inverted levels
+    can't be resolved meaningfully — e.g. a parsed channel tip
+    "BUY @1247 SL 1260 TGT 1230" would book its "stop" as a gain."""
+    try:
+        e, s, t1, t2 = (float(entry), float(stop_loss), float(target1), float(target2))
+    except (TypeError, ValueError):
+        return False
+    if direction == "long":
+        return s < e < t1 <= t2
+    return t2 <= t1 < e < s
+
+
 def log_alert(
     *,
     category: str,           # 'scan' | 'swing_auto' | 'manual_intraday' | 'manual_swing'
@@ -381,12 +408,23 @@ def log_alert(
     generated_at: datetime | None = None,
     score: float | None = None,
     features: dict | None = None,
-) -> int:
-    """Insert an alert row. Returns new alert_id.
+) -> int | None:
+    """Insert an alert row. Returns new alert_id, or None when the row is
+    rejected (inconsistent levels — logged, never stored).
 
     `features` is the decision-time snapshot (see features.py builders) stored
     as canonical JSON; `score` is the numeric engine score. Both optional —
-    older callers keep working unchanged."""
+    older callers keep working unchanged.
+
+    `direction` is stored canonically as long/short. Manual and swing_auto
+    callers pass the analyzer's BUY/SELL; stored raw, every BUY was resolved
+    by eod_report as a SHORT (P&L sign, SL/target sides and MFE/MAE flipped)."""
+    direction = normalize_direction(direction)
+    if not levels_consistent(direction, entry, stop_loss, target1, target2):
+        logger.warning("log_alert: rejected %s %s %s — inconsistent levels "
+                       "(entry=%s sl=%s t1=%s t2=%s)", category, symbol,
+                       direction, entry, stop_loss, target1, target2)
+        return None
     generated_at = generated_at or datetime.now(timezone.utc)
     trade_date = _ist_today().isoformat()
     features_json = (json.dumps(features, sort_keys=True, default=str)
@@ -524,10 +562,11 @@ def save_outcome(
     with _conn() as c:
         c.execute(
             """
-            INSERT OR REPLACE INTO alert_outcomes
+            INSERT INTO alert_outcomes
                 (alert_id, status, exit_price, exit_time, pnl_pct,
                  mfe_pct, mae_pct, duration_min, resolved_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(alert_id) DO NOTHING
             """,
             (alert_id, status, exit_price,
              exit_time.isoformat() if exit_time else None,

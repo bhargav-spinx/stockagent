@@ -357,14 +357,23 @@ class TelethonListener:
             lines.append(f"🛑 SL:     ₹{tip['sl']:,.2f}")
         summary = "\n".join(lines)
 
+        # Delivery failure must NOT skip the tracking below: the old early
+        # `return` meant one Telegram hiccup left the tip out of channel_tip /
+        # channel_call (and so out of the channel scorecard) — only raw_tips
+        # kept it. Markdown first, plain-text fallback (channel text can carry
+        # unbalanced * / _).
         try:
             await self.bot_app.bot.send_message(
                 self.notify_user_id, summary, parse_mode="Markdown"
             )
         except Exception as e:
-            logger.warning("Telethon: send to user %s failed: %s",
-                          self.notify_user_id, e)
-            return
+            logger.warning("Telethon: Markdown send to user %s failed (%s) — "
+                           "retrying as plain text", self.notify_user_id, e)
+            try:
+                await self.bot_app.bot.send_message(self.notify_user_id, summary)
+            except Exception as e2:
+                logger.warning("Telethon: send to user %s failed: %s",
+                               self.notify_user_id, e2)
 
         # Persist the forwarded tip as a tracked trade (#5) so it resolves and
         # appears in the EOD report, swing-completion DMs and /stats — giving

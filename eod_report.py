@@ -109,21 +109,78 @@ def _blended_pct(entry: float, leg1_exit: float, leg2_exit: float,
             + 0.5 * _signed_pct(entry, leg2_exit, direction))
 
 
+def _norm_direction(direction: Any) -> str:
+    """Canonical trade direction. Alerts were historically logged with BOTH
+    vocabularies — scan/channel rows as long/short, manual + swing_auto rows
+    as the analyzer's BUY/SELL — and every non-"long" value fell into the
+    SHORT branch, so BUY alerts were resolved (P&L sign, SL/target sides,
+    MFE/MAE) as shorts. Unknown values raise rather than guess a side."""
+    d = str(direction or "").strip().lower()
+    if d in ("long", "buy"):
+        return "long"
+    if d in ("short", "sell"):
+        return "short"
+    raise ValueError(f"unknown trade direction {direction!r}")
+
+
+def _stop_fill(row, stop: float, direction: str) -> float:
+    """Fill price for a stop touched inside `row`. A bar that OPENS through
+    the stop (gap) fills at the open, not the stop — booking the stop price
+    there understates the loss (a swing bar opening at 90 against a 97 stop
+    is ~−10%, not −3%)."""
+    o = float(row["Open"])
+    if direction == "long":
+        return min(o, stop)
+    return max(o, stop)
+
+
+# NSE's final 5-min candle starts 15:25; the session closes 15:30.
+_LAST_CANDLE_START = dt_time(15, 25)
+_SESSION_CLOSE = dt_time(15, 30)
+
+
+def _session_complete(post: pd.DataFrame, session_date: date,
+                      now: datetime | None = None) -> bool:
+    """True once `session_date`'s session is over AND its data is final.
+
+    Square-off outcomes (squareoff_no_t1 / t1_then_squareoff) are only true
+    at the close. Resolving at 10:20 (a /today or /stats call during market
+    hours) used to PERSIST a squareoff at the current candle — and a persisted
+    outcome drops the alert from get_open_alerts, so EOD never corrected it."""
+    now = now or datetime.now(IST)
+    close = IST.localize(datetime.combine(session_date, _SESSION_CLOSE))
+    if now < close:
+        return False
+    last_ok = len(post) and post.index[-1].time() >= _LAST_CANDLE_START
+    return bool(last_ok) or now >= close + timedelta(minutes=30)
+
+
 def resolve_intraday(alert: dict[str, Any],
-                     df: pd.DataFrame | None = None) -> dict[str, Any] | None:
+                     df: pd.DataFrame | None = None, *,
+                     mark_to_market: bool = False,
+                     now: datetime | None = None) -> dict[str, Any] | None:
     """
     Resolve an intraday alert by checking 5-min candles after generation.
 
     If `df` is provided, use it (backtest mode — pre-fetched history slice).
     Otherwise fetch the last 5 days from data_provider (live EOD mode).
+
+    Before the session is complete, only FINAL outcomes (SL, T2, breakeven
+    after T1, time-stop) are returned; a trade still running returns "open"
+    unless `mark_to_market=True` (the daily-R gate), which marks it at the
+    current close instead. `generated_at` must be the time the alert became
+    actionable — the trigger candle's CLOSE (live: wall clock after the
+    close; replays must pass candle start + interval).
     """
     symbol = alert["symbol"]
     entry = alert["entry"]
     sl = alert["stop_loss"]
     t1 = alert["target1"]
     t2 = alert["target2"]
-    direction = alert["direction"]
+    direction = _norm_direction(alert["direction"])
     gen_time = _parse_iso(alert["generated_at"]) if isinstance(alert["generated_at"], str) else alert["generated_at"]
+    if gen_time.tzinfo is None:
+        gen_time = IST.localize(gen_time)
 
     if df is None:
         try:
@@ -190,7 +247,8 @@ def resolve_intraday(alert: dict[str, Any],
         if not t1_hit:
             # Conservative: if SL and T1 both touched in same candle, assume SL first
             if sl_in:
-                return _outcome("sl_hit", sl, ts, _signed_pct(entry, sl, direction))
+                fill = _stop_fill(row, sl, direction)
+                return _outcome("sl_hit", fill, ts, _signed_pct(entry, fill, direction))
             # Time-stop: 45 min elapsed with neither SL nor T1. Checked AFTER
             # SL (a stop breach inside the boundary candle must count as a
             # stop, not a time-stop exit at that candle's close) and BEFORE
@@ -216,15 +274,21 @@ def resolve_intraday(alert: dict[str, Any],
                 trail_sl_in = row["High"] >= entry
                 t2_in_now = row["Low"] <= t2
 
+            # Conservative, like the SL-first rule before T1: a candle that
+            # spans BOTH the breakeven stop and T2 is booked as the stop.
+            if trail_sl_in:
+                # 50% booked at T1, 50% trailed out at entry (or the gap open).
+                fill = _stop_fill(row, entry, direction)
+                return _outcome("t1_then_breakeven", fill, ts,
+                                _blended_pct(entry, t1, fill, direction))
             if t2_in_now:
                 return _outcome("t2_hit", t2, ts,
                                 _blended_pct(entry, t1, t2, direction))
-            if trail_sl_in:
-                # 50% booked at T1, 50% trailed out at entry (0%).
-                return _outcome("t1_then_breakeven", entry, ts,
-                                _blended_pct(entry, t1, entry, direction))
 
-    # End of candles: square off at last close
+    # End of candles. A square-off is only an outcome once the session is
+    # over — mid-session the trade is still running.
+    if not mark_to_market and not _session_complete(post, gen_time.date(), now):
+        return {"status": "open"}
     last_ts = post.index[-1]
     last_close = float(post["Close"].iloc[-1])
     if t1_hit:
@@ -235,29 +299,46 @@ def resolve_intraday(alert: dict[str, Any],
                     _signed_pct(entry, last_close, direction))
 
 
-def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve a swing alert using daily candles after generation."""
+SWING_TIME_STOP_SESSIONS = CONFIG.costs.swing_time_stop_sessions
+
+
+def resolve_swing(alert: dict[str, Any],
+                  df: pd.DataFrame | None = None, *,
+                  now: datetime | None = None) -> dict[str, Any] | None:
+    """Resolve a swing alert using daily candles after generation.
+
+    A trade that reaches neither SL nor T1 (or, after T1, neither T2 nor
+    breakeven) within SWING_TIME_STOP_SESSIONS sessions is closed at that
+    session's close (time_stop / t1_then_squareoff). Without it such trades
+    stayed "open" until they aged out of the resolver window and silently
+    vanished from /stats — a selection bias toward trades that moved."""
     symbol = alert["symbol"]
     entry = alert["entry"]
     sl = alert["stop_loss"]
     t1 = alert["target1"]
     t2 = alert["target2"]
-    direction = alert["direction"]
-    gen_time = _parse_iso(alert["generated_at"])
+    direction = _norm_direction(alert["direction"])
+    gen_time = _parse_iso(alert["generated_at"]) if isinstance(alert["generated_at"], str) else alert["generated_at"]
+    if gen_time.tzinfo is None:
+        gen_time = IST.localize(gen_time)
+    now = now or datetime.now(IST)
 
-    try:
-        df = fetch_data(symbol, period="3mo", interval="1d")
-    except Exception as e:
-        logger.warning("resolve_swing %s: data fetch failed: %s", symbol, e)
-        return {"status": "no_data"}
+    if df is None:
+        try:
+            df = fetch_data(symbol, period="3mo", interval="1d")
+        except Exception as e:
+            logger.warning("resolve_swing %s: data fetch failed: %s", symbol, e)
+            return {"status": "no_data"}
 
     if df.index.tz is None:
         df = df.tz_localize(IST)
     elif str(df.index.tz) != str(IST):
         df = df.tz_convert(IST)
 
-    # Daily bars strictly AFTER the alert date
+    # Daily bars strictly AFTER the alert date; today's bar only once final.
     post = df[df.index.date > gen_time.date()]
+    if len(post) and post.index[-1].date() == now.date() and now.time() < _SESSION_CLOSE:
+        post = post.iloc[:-1]
     if len(post) == 0:
         return {"status": "open"}
 
@@ -278,7 +359,7 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
             "duration_min": round((ts - gen_time).total_seconds() / 60.0, 1),
         }
 
-    for ts, row in post.iterrows():
+    for n, (ts, row) in enumerate(post.iterrows(), start=1):
         fav = float(row["High"] if direction == "long" else row["Low"])
         adv = float(row["Low"] if direction == "long" else row["High"])
         mfe = max(mfe, _signed_pct(entry, fav, direction))
@@ -295,7 +376,8 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
 
         if not t1_hit:
             if sl_in:
-                return _outcome("sl_hit", sl, ts, _signed_pct(entry, sl, direction))
+                fill = _stop_fill(row, sl, direction)
+                return _outcome("sl_hit", fill, ts, _signed_pct(entry, fill, direction))
             if t1_in:
                 t1_hit = True
                 if t2_in:
@@ -308,12 +390,21 @@ def resolve_swing(alert: dict[str, Any]) -> dict[str, Any] | None:
             else:
                 trail_sl_in = row["High"] >= entry
                 t2_in_now = row["Low"] <= t2
+            if trail_sl_in:                   # conservative: stop before T2
+                fill = _stop_fill(row, entry, direction)
+                return _outcome("t1_then_breakeven", fill, ts,
+                                _blended_pct(entry, t1, fill, direction))
             if t2_in_now:
                 return _outcome("t2_hit", t2, ts,
                                 _blended_pct(entry, t1, t2, direction))
-            if trail_sl_in:
-                return _outcome("t1_then_breakeven", entry, ts,
-                                _blended_pct(entry, t1, entry, direction))
+
+        if n >= SWING_TIME_STOP_SESSIONS:
+            close = float(row["Close"])
+            if t1_hit:
+                return _outcome("t1_then_squareoff", close, ts,
+                                _blended_pct(entry, t1, close, direction))
+            return _outcome("time_stop", close, ts,
+                            _signed_pct(entry, close, direction))
 
     return {"status": "open"}
 
@@ -345,13 +436,16 @@ def today_intraday_realized_r() -> list[float]:
     today = subscriptions.get_alerts_for_date()
     rows: list[dict] = []
     for a in today:
-        if a["category"] not in INTRADAY_CATEGORIES:
+        # Only the bot's OWN auto-scan signals spend the budget. manual_intraday
+        # rows are logged once per user query (duplicated across users), so
+        # counting them let ad-hoc lookups offset — or fake — real losses.
+        if a["category"] != "scan":
             continue
         if a.get("pnl_pct") is not None:       # already persisted (rare intraday)
             rows.append(a)
             continue
         try:
-            outcome = resolve_intraday(a)
+            outcome = resolve_intraday(a, mark_to_market=True)
         except Exception:
             outcome = None
         if (outcome and outcome.get("pnl_pct") is not None
@@ -360,12 +454,25 @@ def today_intraday_realized_r() -> list[float]:
     return realized_r(rows)
 
 
-def resolve_pending(max_age_days: int = 30) -> int:
+# One resolver window for the EOD job AND /stats. Must exceed the swing
+# time-stop horizon (20 sessions ≈ 28–30 calendar days incl. holidays) so a
+# swing call always gets its time-stop outcome before it ages out.
+RESOLVE_MAX_AGE_DAYS = 45
+
+
+def resolve_pending(max_age_days: int = RESOLVE_MAX_AGE_DAYS) -> int:
     """Resolve all open alerts up to max_age_days. Returns count of newly resolved."""
     open_alerts = subscriptions.get_open_alerts(max_age_days=max_age_days)
     resolved = 0
     for alert in open_alerts:
-        outcome = resolve_alert(alert)
+        try:
+            outcome = resolve_alert(alert)
+        except Exception as e:
+            # One malformed row (e.g. an unknown direction) must not abort
+            # resolution of every other open alert.
+            logger.warning("resolve_pending: alert %s (%s) skipped: %s",
+                           alert.get("id"), alert.get("symbol"), e)
+            continue
         # "no_data" is a TRANSIENT fetch failure, not a trade outcome. Never
         # persist it: a saved outcome row permanently removes the alert from
         # get_open_alerts, so one rate-limited fetch would silently erase a
@@ -471,7 +578,7 @@ def build_report(user_id: int | None = None,
     If `today_rejection_stats` is provided AND the day has zero alerts, the
     report includes a "why no alerts today?" breakdown.
     """
-    resolved_now = resolve_pending(max_age_days=30)
+    resolved_now = resolve_pending(max_age_days=RESOLVE_MAX_AGE_DAYS)
     if resolved_now:
         logger.info("EOD: resolved %d pending alerts", resolved_now)
 
@@ -550,13 +657,17 @@ def _format_exposure_section() -> str:
 # ---------- swing-completion notification ----------
 
 # Statuses at which a swing trade is considered finished (vs. still "open").
-SWING_TERMINAL_STATUSES = tuple(PASS_STATUSES | FAIL_STATUSES)
+# time_stop is terminal for swing too (resolve_swing closes stalled trades
+# after SWING_TIME_STOP_SESSIONS) — the user must hear that a call ended.
+SWING_TERMINAL_STATUSES = tuple(PASS_STATUSES | FAIL_STATUSES | {"time_stop"})
 
 _SWING_HEADLINE = {
     "t2_hit": "🎯 Target hit — full move captured",
-    "t1_then_squareoff": "🎯 Target 1 hit, rest squared off",
+    "t1_then_squareoff": "🎯 Target 1 hit, rest closed at the time-stop",
     "t1_then_breakeven": "🟡 Target 1 hit, trailed out at breakeven",
     "sl_hit": "🛑 Stop-loss hit",
+    "time_stop": (f"⏸ Time-stop — neither stop nor target within "
+                  f"{CONFIG.costs.swing_time_stop_sessions} sessions"),
 }
 
 

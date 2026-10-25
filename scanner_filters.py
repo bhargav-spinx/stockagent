@@ -153,7 +153,7 @@ def round_number_filter(df: pd.DataFrame, direction: str,
     return FilterResult(True)
 
 
-def apply_universal_filters(df: pd.DataFrame, direction: str = "long",
+def apply_universal_filters(df: pd.DataFrame, direction: str | None = "long",
                             check_time: bool = True) -> FilterResult:
     """
     Run all §5 universal filters. Returns first failure or pass.
@@ -161,6 +161,11 @@ def apply_universal_filters(df: pd.DataFrame, direction: str = "long",
     `check_time=False` skips the time-of-day filter — useful for
     backtesting / off-hours testing where you want to validate the
     setup detection without waiting for market hours.
+
+    `direction=None` runs only the direction-NEUTRAL gates (the pre-detection
+    pass). The round-number gate is directional — a pre-pass with "long"
+    rejected every stock sitting just BELOW a round number before any
+    detector ran, so valid shorts there were never even evaluated.
     """
     filters = []
     if check_time:
@@ -169,8 +174,9 @@ def apply_universal_filters(df: pd.DataFrame, direction: str = "long",
         atr_bounds_filter(df),
         trigger_volume_filter(df),
         vwap_slope_filter(df),
-        round_number_filter(df, direction),
     ])
+    if direction is not None:
+        filters.append(round_number_filter(df, direction))
     for f in filters:
         if not f.passed:
             return f

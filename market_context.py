@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -245,8 +246,17 @@ def latest_news(symbol: str, limit: int = MARKETAUX_ARTICLES) -> list[dict] | No
         _news_cache["by_symbol"][base] = articles
         return articles
     except Exception as e:
-        logger.warning("marketaux: fetch failed for %s: %s", base, e)
+        # requests' connection/SSL errors embed the full URL — including the
+        # api_token query param — in str(e); redact before it reaches logs.
+        logger.warning("marketaux: fetch failed for %s: %s", base,
+                       _redact_token(str(e), token))
         return None
+
+
+def _redact_token(text: str, token: str | None) -> str:
+    """Strip the Marketaux API token from an error string."""
+    text = re.sub(r"api_token=[^&\s'\"]+", "api_token=***", text)
+    return text.replace(token, "***") if token else text
 
 
 def news_summary(symbol: str, limit: int = MARKETAUX_ARTICLES) -> str | None:

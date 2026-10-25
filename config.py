@@ -141,6 +141,7 @@ class CostConfig:
     published 2025-26 intraday figures; update on Budget changes."""
     cost_per_trade_pct: float = 0.13    # STRATEGY.md §8 round-trip estimate
     intraday_time_stop_min: int = 45
+    swing_time_stop_sessions: int = 20  # close a swing call after N sessions
     model: str = "flat"                 # "flat" | "statutory"
     brokerage_pct: float = 0.03         # discount-broker % per side…
     brokerage_cap_inr: float = 20.0     # …capped at ₹20/order
@@ -166,8 +167,10 @@ class RegimeConfig:
     breadth_bullish: float = 0.60       # universe fraction above VWAP
     breadth_bearish: float = 0.40
     range_lookback_days: int = 10
-    expiry_weekday: int = 3             # NIFTY weekly expiry weekday (0=Mon);
-                                        # NSE reshuffles this — config, not code
+    expiry_weekday: int = 1             # NIFTY weekly expiry weekday (0=Mon):
+                                        # TUESDAY since 2025-09-01 (SEBI expiry
+                                        # harmonisation; was Thursday). NSE
+                                        # reshuffles this — config, not code
     cache_ttl_min: int = 15             # live snapshot (VIX etc.) cache
 
 

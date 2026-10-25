@@ -50,6 +50,30 @@ def is_trading_holiday(d: date) -> bool:
     return d in _load()
 
 
+# NSE closes on ~14–16 weekdays a year. Far fewer listed weekday closures means
+# the variable/lunar dates were never added — the failure mode that let the bot
+# scan the 2026 Holi/Good Friday/Dussehra closures on the previous session's
+# candles as if they were live.
+MIN_WEEKDAY_HOLIDAYS_PER_YEAR = 10
+
+
+def coverage_warning(today: date | None = None) -> str | None:
+    """Human-readable warning when the holiday file looks incomplete for the
+    current year (or, in December, for next year). None when coverage is OK."""
+    today = today or date.today()
+    years = [today.year] + ([today.year + 1] if today.month == 12 else [])
+    gaps = []
+    for y in years:
+        n = sum(1 for d in _load() if d.year == y and d.weekday() < 5)
+        if n < MIN_WEEKDAY_HOLIDAYS_PER_YEAR:
+            gaps.append(f"{y}: {n} weekday holidays listed")
+    if not gaps:
+        return None
+    return ("nse_holidays.txt looks incomplete (" + "; ".join(gaps) + ") — add "
+            "the dates from the NSE holiday circular, or scans will run on "
+            "stale candles on unlisted holidays")
+
+
 def reload() -> None:
     """Drop the cache so an edited holiday file is picked up without a restart."""
     global _cache

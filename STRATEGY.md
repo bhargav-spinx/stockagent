@@ -47,7 +47,7 @@ Only trade names that pass **all** of these checks. Refresh the universe monthly
 | Delivery % (prev day) | ≥ 35% | NSE bhavcopy CSV (must scrape; no API equivalent) |
 | Price | ₹100 – ₹5,000 (avoid penny + ultra-high priced) | yfinance / Angel |
 
-**Tier-1 starting watchlist:** RELIANCE, HDFCBANK, ICICIBANK, SBIN, AXISBANK, KOTAKBANK, INFY, TCS, LT, BAJFINANCE, MARUTI, TATAMOTORS, ITC, HINDUNILVR.
+**Tier-1 starting watchlist:** RELIANCE, HDFCBANK, ICICIBANK, SBIN, AXISBANK, KOTAKBANK, INFY, TCS, LT, BAJFINANCE, MARUTI, TMPV (ex-TATAMOTORS), ITC, HINDUNILVR.
 
 ---
 
@@ -103,6 +103,8 @@ Pick **one** per stock per day. Don't re-enter the same name after a stop-out. E
 
 ### Setup B — VWAP Pullback Continuation
 
+> **Status: NOT IMPLEMENTED** (`scanner_setups.detect_setup_b` is a stub returning None). Specification only — implement and validate walk-forward before relying on it.
+
 - **Setup context:** After a strong morning trend, price retraces to VWAP and bounces.
 - **Buy trigger:** Bullish reversal candle (hammer / engulfing) at VWAP, followed by next candle taking out the wick high.
 - **Sell trigger:** Mirror image — bearish reversal at VWAP from above, followed by breakdown candle.
@@ -113,6 +115,8 @@ Pick **one** per stock per day. Don't re-enter the same name after a stop-out. E
 - **Best window:** 10:00 – 11:30 AM and 1:30 – 2:30 PM.
 
 ### Setup C — Range Reversal at Key Level
+
+> **Status: NOT IMPLEMENTED** (`scanner_setups.detect_setup_c` is a stub returning None).
 
 - **Setup context:** Stock rejecting **previous day's high/low** or a clean intraday S/R zone.
 - **Buy trigger:** Double-bottom or higher-low at support.
@@ -125,6 +129,8 @@ Pick **one** per stock per day. Don't re-enter the same name after a stop-out. E
 ---
 
 ## 7. Entry, Stop, Target & Exit Rules
+
+> **As implemented** (canonical; `scanner_indicators.trade_levels`, resolved by `eod_report.resolve_intraday`, pinned by golden-parity tests): entry = trigger-candle close; SL = `1.5 × ATR(14)` on 5-min (no swing-low tightening); **T1 = 2R, T2 = 3R** (50% / 50%); after T1 the stop moves to entry; no EMA-9 trail; 45-min time-stop if neither SL nor T1; remainder squared off at the session close. Setup A entries are capped at `orb_max_extension_pct` (2%) beyond the opening range. The 1% / 2% targets and swing-low stop in the tables below are the ORIGINAL spec, not current behaviour — switching to them is a strategy change that must be validated walk-forward first.
 
 ### Entry
 

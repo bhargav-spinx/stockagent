@@ -123,24 +123,33 @@ def _fresh_db(name: str) -> None:
 
 def test_daily_r_uses_intraday_resolution_not_persisted_pnl(monkeypatch):
     # The gate must see TODAY's stop-outs during market hours, not wait for EOD.
-    # get_alerts_for_date returns an open intraday alert (pnl None) + a swing
-    # alert (must be excluded) + an already-resolved intraday alert.
+    # get_alerts_for_date returns an open scan alert (pnl None) + a swing
+    # alert (must be excluded) + an already-resolved scan alert + a manual
+    # per-user lookup (must be excluded: only the bot's own scan signals
+    # spend the budget — manual rows are duplicated per user/query).
     open_intraday = {"category": "scan", "entry": 100.0, "stop_loss": 98.0,
                      "pnl_pct": None, "symbol": "A.NS", "direction": "long"}
     swing = {"category": "swing_auto", "entry": 100.0, "stop_loss": 98.0,
              "pnl_pct": -2.0, "symbol": "S.NS", "direction": "long"}
-    resolved_intraday = {"category": "manual_intraday", "entry": 100.0,
+    resolved_intraday = {"category": "scan", "entry": 100.0,
                          "stop_loss": 98.0, "pnl_pct": -2.0, "symbol": "B.NS",
                          "direction": "long"}
+    manual = {"category": "manual_intraday", "entry": 100.0, "stop_loss": 98.0,
+              "pnl_pct": 2.0, "symbol": "M.NS", "direction": "long"}
     monkeypatch.setattr(eod_report.subscriptions, "get_alerts_for_date",
-                        lambda *a, **k: [open_intraday, swing, resolved_intraday])
-    # the open one is resolved on-demand against the current session → sl_hit
-    monkeypatch.setattr(eod_report, "resolve_intraday",
-                        lambda a, df=None: {"status": "sl_hit", "pnl_pct": -2.0})
+                        lambda *a, **k: [open_intraday, swing, resolved_intraday, manual])
+    # the open one is resolved on-demand (mark-to-market) → sl_hit
+    seen = {}
+
+    def fake_resolve(a, df=None, **kw):
+        seen.update(kw)
+        return {"status": "sl_hit", "pnl_pct": -2.0}
+    monkeypatch.setattr(eod_report, "resolve_intraday", fake_resolve)
 
     r_list = eod_report.today_intraday_realized_r()
-    # entry100/stop98 → risk 2% → pnl -2% → -1R each; swing excluded
+    # entry100/stop98 → risk 2% → pnl -2% → -1R each; swing + manual excluded
     assert r_list == [-1.0, -1.0]
+    assert seen.get("mark_to_market") is True   # live runner marked, not "open"
 
     from engines.risk import DailyRiskLedger
     ledger = DailyRiskLedger(2.0)

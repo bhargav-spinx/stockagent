@@ -40,7 +40,7 @@ from engines import volume as volume_engine
 from engines import vwap as vwap_engine
 from scanner_indicators import (
     vwap, ema, supertrend,
-    localize_ist, split_sessions, volume_ratio, trade_levels,
+    localize_ist, split_sessions, volume_ratio, trade_levels, stale_reason,
 )
 
 # --- Rating thresholds (config.ScoreConfig; names kept for importers) --------
@@ -143,11 +143,20 @@ def index_trend(aliases=("NIFTY", "BANKNIFTY")) -> dict:
             df = fetch_data(alias, period="5d", interval="5m")
             from analyzer import drop_forming_candle
             df = drop_forming_candle(df, "5m")   # live: ignore unclosed candle
+            if stale_reason(df):
+                continue                    # omitted → gate fails open, annotated
             today, _ = split_sessions(df)
             if len(today) < 3:
                 continue
             price = float(today["Close"].iloc[-1])
             vw = float(vwap(df).iloc[-1])
+            if vw != vw:
+                # Index candles carry NO volume (Angel index tokens, yfinance
+                # ^NSEI), so VWAP is NaN — and `price > NaN` / `price < NaN`
+                # are both False: every index read "flat", regime_ok could
+                # never be False, and the counter-trend veto never fired.
+                # Volume-free anchor: today's mean typical price.
+                vw = float(((today["High"] + today["Low"] + today["Close"]) / 3).mean())
             e20 = float(ema(df["Close"], 20).iloc[-1])
             if price > vw and price > e20:
                 out[alias] = "bullish"
@@ -198,10 +207,14 @@ def score_stock(df: pd.DataFrame, symbol: str,
     volbk = volume_ratio(df)
 
     # --- Direction vote: gap / VWAP / EMA / ORB ---
+    # Ties and undefined inputs abstain: a flat open (gap == 0) or an
+    # undefined VWAP (no traded volume yet today → NaN) used to fall through
+    # to `else -1` and count as a SHORT vote.
     votes = 0
-    if gap is not None:
+    if gap:
         votes += 1 if gap > 0 else -1
-    votes += 1 if price > vw else -1
+    if vw == vw and price != vw:
+        votes += 1 if price > vw else -1
     votes += 1 if e20 > e50 else -1
     if orb_dir == "long":
         votes += 1
@@ -226,7 +239,8 @@ def score_stock(df: pd.DataFrame, symbol: str,
 
     # Gap (20)
     breakdown["Gap Up/Down"] = gap_engine.gap_points(gap, long, cs)
-    signals["Gap"] = (f"{'Up' if (gap or 0) > 0 else 'Down'} {abs(gap):.2f}%"
+    signals["Gap"] = (("Flat 0.00%" if gap == 0 else
+                       f"{'Up' if gap > 0 else 'Down'} {abs(gap):.2f}%")
                       if gap is not None else "n/a")
 
     # Relative Volume (25)
@@ -236,7 +250,8 @@ def score_stock(df: pd.DataFrame, symbol: str,
     # VWAP Confirmation (15)
     breakdown["VWAP Confirmation"] = vwap_engine.confirmation_points(
         price, vw, long, cs)
-    signals["VWAP"] = "Bullish" if price > vw else "Bearish"
+    signals["VWAP"] = ("n/a" if vw != vw else
+                       "Bullish" if price > vw else "Bearish")
 
     # EMA Trend 20>50 (15)
     ema_ok = (e20 > e50) if long else (e20 < e50)

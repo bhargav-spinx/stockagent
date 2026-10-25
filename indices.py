@@ -33,6 +33,21 @@ PRIMARY = {
         "angel_symbol": "SENSEX",
         "display": "SENSEX",
     },
+    "FINNIFTY": {
+        "yf": "NIFTY_FIN_SERVICE.NS",
+        "angel_exchange": "NSE",
+        "angel_token": "99926037",
+        "angel_symbol": "Nifty Fin Service",
+        "display": "NIFTY Fin Service",
+    },
+    # Volatility index — context only (regime features). Not in PRIMARY_INDICES.
+    "INDIAVIX": {
+        "yf": "^INDIAVIX",
+        "angel_exchange": "NSE",
+        "angel_token": "99926017",
+        "angel_symbol": "India VIX",
+        "display": "India VIX",
+    },
 }
 
 # Friendly alias → primary key. Case + spaces + hyphens stripped on lookup.
@@ -42,10 +57,18 @@ ALIASES = {
     "BANKNIFTY": "BANKNIFTY",
     "NIFTYBANK": "BANKNIFTY",
     "SENSEX": "SENSEX",
-    "BSE": "SENSEX",
+    # NOTE: no "BSE" alias — BSE is also a real NSE-listed stock (BSE Ltd,
+    # BSE-EQ, in the F&O universe); aliasing it to SENSEX made that stock
+    # unanalysable and silently scored the index in its place.
+    "FINNIFTY": "FINNIFTY",
+    "NIFTYFIN": "FINNIFTY",
+    "NIFTYFINSERVICE": "FINNIFTY",
+    "NIFTYFINANCIALSERVICES": "FINNIFTY",
+    "NIFTY_FIN_SERVICE": "FINNIFTY",          # yfinance ticker, .NS stripped
+    "INDIAVIX": "INDIAVIX",
 }
 
-PRIMARY_INDICES: list[str] = ["NIFTY", "BANKNIFTY", "SENSEX"]
+PRIMARY_INDICES: list[str] = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
 
 
 def _normalize(symbol: str) -> str:

@@ -17,6 +17,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import timedelta
 from typing import Iterable
 
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ ssl_dev.install_if_enabled()
 from data_provider import fetch_data  # noqa: E402
 from analyzer import normalize_symbol, drop_forming_candle  # noqa: E402
 from scanner_filters import apply_universal_filters  # noqa: E402
+from scanner_indicators import localize_ist, stale_reason  # noqa: E402
 from scanner_setups import ALL_DETECTORS, Signal, signal_metrics  # noqa: E402
 from universe import (  # noqa: E402
     INTRADAY_UNIVERSE,
@@ -64,10 +66,14 @@ def scan_one(symbol: str, check_time: bool = True) -> dict:
     if len(df) < 30:
         return {"symbol": sym, "status": "skip",
                 "reason": f"Insufficient data ({len(df)} candles)"}
+    if check_time:                       # live mode: refuse stale candles
+        stale = stale_reason(df)
+        if stale:
+            return {"symbol": sym, "status": "skip", "reason": stale}
 
-    # First pass: check universal filters with neutral 'long' bias.
-    # Direction-specific re-check happens after a setup matches.
-    f = apply_universal_filters(df, direction="long", check_time=check_time)
+    # First pass: direction-neutral universal filters only. Directional
+    # gates (round number) run after a setup decides the direction.
+    f = apply_universal_filters(df, direction=None, check_time=check_time)
     if not f.passed:
         return {"symbol": sym, "status": "skip", "reason": f.reason}
 
@@ -86,10 +92,16 @@ def scan_one(symbol: str, check_time: bool = True) -> dict:
     return {"symbol": sym, "status": "no_setup"}
 
 
-def score_one(symbol: str, idx_trend: dict | None = None) -> dict:
+def score_one(symbol: str, idx_trend: dict | None = None,
+              require_fresh: bool = False) -> dict:
     """Score a single symbol with the 100-point intraday model.
     Returns {"symbol", "status": "scored", "scorecard": ScoreCard}
-    or {"symbol", "status": "error", "reason": str}."""
+    or {"symbol", "status": "error", "reason": str}.
+
+    `require_fresh=True` (the auto-alert path) refuses data whose last candle
+    isn't from the current session — otherwise yesterday's session is scored
+    as "today" and alerted at yesterday's prices. Manual /score leaves it off
+    so an off-hours lookup still shows the last session."""
     import intraday_score
 
     sym = _normalize(symbol)
@@ -101,11 +113,32 @@ def score_one(symbol: str, idx_trend: dict | None = None) -> dict:
     if len(df) < 30:
         return {"symbol": sym, "status": "error",
                 "reason": f"Insufficient data ({len(df)} candles)"}
+    if require_fresh:
+        stale = stale_reason(df)
+        if stale:
+            return {"symbol": sym, "status": "error", "reason": stale}
     try:
         card = intraday_score.score_stock(df, sym, idx_trend=idx_trend)
     except Exception as e:
         return {"symbol": sym, "status": "error", "reason": str(e)}
+    card.context.append(_data_stamp(df))
     return {"symbol": sym, "status": "scored", "scorecard": card}
+
+
+_SOURCE_LABEL = {"angel": "Angel One", "yfinance": "Yahoo, ~15 min delayed"}
+
+
+def _data_stamp(df) -> str:
+    """'Data as of 10:35 IST · Angel One' — the close time of the last candle
+    actually used and the provider that ACTUALLY served it. Alerts can reach
+    the user minutes after the trigger candle (scan budget + enrichment), and
+    the yfinance path is delayed; both must be visible on the card."""
+    try:
+        last = localize_ist(df).index[-1] + timedelta(minutes=5)
+        src = df.attrs.get("source")
+        return f"Data as of {last:%H:%M} IST · {_SOURCE_LABEL.get(src, src or 'unknown source')}"
+    except Exception:
+        return "Data time unavailable"
 
 
 # Angel historical-data rate limit ~3 req/sec. Pace at 0.5s between calls
@@ -142,10 +175,12 @@ def _paced_map(fn, symbols: Iterable[str], pacing_sec: float,
 
 def score_many(symbols: Iterable[str], idx_trend: dict | None = None,
                pacing_sec: float = SCAN_PACING_SEC,
-               deadline_sec: float | None = None) -> list[dict]:
+               deadline_sec: float | None = None,
+               require_fresh: bool = False) -> list[dict]:
     """Score symbols sequentially, pacing between Angel calls."""
-    return _paced_map(lambda s: score_one(s, idx_trend=idx_trend), symbols,
-                      pacing_sec, deadline_sec=deadline_sec)
+    return _paced_map(lambda s: score_one(s, idx_trend=idx_trend,
+                                          require_fresh=require_fresh),
+                      symbols, pacing_sec, deadline_sec=deadline_sec)
 
 
 def scan_many(symbols: Iterable[str], check_time: bool = True,

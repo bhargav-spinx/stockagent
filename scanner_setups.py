@@ -76,8 +76,14 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
     notes = (f"ORB {orb_low:.2f}–{orb_high:.2f} "
              f"({orb_range_pct*100:.2f}% range)")
 
+    # Spent-move cap (shared with the scorer's ORB rule): any close beyond the
+    # range used to fire, however far past it — e.g. a 13:45 LONG entered
+    # 4.7% above an ORB first broken at 09:50, with stops/targets sized as if
+    # the breakout were fresh.
+    max_ext = CONFIG.score.orb_max_extension_pct / 100.0
+
     # Long trigger: closes above ORB high
-    if last_price > orb_high:
+    if orb_high < last_price <= orb_high * (1 + max_ext):
         confluences = []
         if last_price > vwap_val:
             confluences.append(f"Price > VWAP ({vwap_val:.2f})")
@@ -100,7 +106,7 @@ def detect_setup_a(df: pd.DataFrame, symbol: str) -> Signal | None:
             )
 
     # Short trigger: closes below ORB low
-    if last_price < orb_low:
+    if orb_low * (1 - max_ext) <= last_price < orb_low:
         confluences = []
         if last_price < vwap_val:
             confluences.append(f"Price < VWAP ({vwap_val:.2f})")

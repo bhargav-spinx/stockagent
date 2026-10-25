@@ -32,25 +32,30 @@ _ACTION_SELL = re.compile(
     re.IGNORECASE,
 )
 
-# Labelled prices — most reliable signal that this is a tip
+# Labelled prices — most reliable signal that this is a tip.
+# A price may carry thousands separators ("1,247.50", Indian "1,24,700").
+_PRICE = r"₹?\s*([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]{2,6}(?:\.[0-9]{1,2})?)"
 _PRICE_ENTRY = re.compile(
     r"(?:@|\bat\b|\bentry\b|\bbuy\s*at\b|\bsell\s*at\b|\bcmp\b|\blevel\b)\s*:?\s*"
-    r"₹?\s*([0-9]{2,6}(?:\.[0-9]{1,2})?)",
+    + _PRICE,
     re.IGNORECASE,
 )
 _PRICE_TARGET = re.compile(
-    r"(?:\btarget\b|\btgt\b|\bt1\b|\btp\b|\btarget\s*1\b)\s*:?\s*"
-    r"₹?\s*([0-9]{2,6}(?:\.[0-9]{1,2})?)",
+    r"(?:\btarget\b|\btgt\b|\bt1\b|\btp\b|\btarget\s*1\b)\s*:?\s*(?:(?:at|@)\s*)?" + _PRICE,
     re.IGNORECASE,
 )
 _PRICE_TARGET2 = re.compile(
-    r"(?:\bt2\b|\btarget\s*2\b|\btp2\b)\s*:?\s*"
-    r"₹?\s*([0-9]{2,6}(?:\.[0-9]{1,2})?)",
+    r"(?:\bt2\b|\btarget\s*2\b|\btp2\b)\s*:?\s*(?:(?:at|@)\s*)?" + _PRICE,
     re.IGNORECASE,
 )
 _PRICE_SL = re.compile(
-    r"(?:\bsl\b|\bstop\s*loss\b|\bstoploss\b|\bstop\b)\s*:?\s*"
-    r"₹?\s*([0-9]{2,6}(?:\.[0-9]{1,2})?)",
+    r"(?:\bsl\b|\bstop\s*loss\b|\bstoploss\b|\bstop\b)\s*:?\s*(?:(?:at|@)\s*)?" + _PRICE,
+    re.IGNORECASE,
+)
+# "target at 3600" / "SL at 1180": an "at" right after a target/SL keyword
+# labels THAT level, not the entry.
+_LEVEL_KEYWORD_TAIL = re.compile(
+    r"(?:\btarget\s*\d?|\btgt\d?|\bt[12]|\btp\d?|\bsl|\bstop\s*loss|\bstoploss|\bstop)\s*:?\s*$",
     re.IGNORECASE,
 )
 
@@ -66,7 +71,18 @@ _NON_TICKER_WORDS = {
     "QTY", "RSI", "MACD", "EMA", "SMA", "ATR", "VWAP", "CALL", "PUT",
     "PE", "CE", "STRIKE", "EXPIRY", "OI", "FII", "DII", "IPO", "PSU",
     "NEWS", "RESULTS", "Q1", "Q2", "Q3", "Q4", "FY25", "FY26",
+    "NSE",
 }
+# Exchange name that is ALSO a listed stock (BSE Ltd): used as the symbol only
+# when no other ticker is present ("BSE: BUY RELIANCE…" means RELIANCE).
+_EXCHANGE_WORDS = {"BSE"}
+
+
+def _to_price(raw: str) -> Optional[float]:
+    try:
+        return float(raw.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _first_match(pattern: re.Pattern, text: str) -> Optional[float]:
@@ -74,9 +90,21 @@ def _first_match(pattern: re.Pattern, text: str) -> Optional[float]:
     if not m:
         return None
     try:
-        return float(m.group(1))
-    except (ValueError, IndexError):
+        return _to_price(m.group(1))
+    except IndexError:
         return None
+
+
+def _entry_match(text: str) -> Optional[float]:
+    """First entry-labelled price that isn't actually a target/SL ("target
+    at 3600" used to be read as entry=3600)."""
+    for m in _PRICE_ENTRY.finditer(text):
+        if _LEVEL_KEYWORD_TAIL.search(text[max(0, m.start() - 16):m.start()]):
+            continue
+        price = _to_price(m.group(1))
+        if price is not None:
+            return price
+    return None
 
 
 def _find_symbol(text: str, known_tickers: set[str]) -> Optional[str]:
@@ -88,7 +116,8 @@ def _find_symbol(text: str, known_tickers: set[str]) -> Optional[str]:
             continue
         if tok in known_tickers and tok not in seen:
             seen.append(tok)
-    return seen[0] if seen else None
+    preferred = [s for s in seen if s not in _EXCHANGE_WORDS]
+    return (preferred or seen)[0] if seen else None
 
 
 def extract_tip(text: str, known_tickers: set[str]) -> Optional[dict]:
@@ -120,7 +149,7 @@ def extract_tip(text: str, known_tickers: set[str]) -> Optional[dict]:
     return {
         "symbol": symbol,
         "action": action,
-        "entry": _first_match(_PRICE_ENTRY, text),
+        "entry": _entry_match(text),
         "target": _first_match(_PRICE_TARGET, text),
         "target2": _first_match(_PRICE_TARGET2, text),
         "sl": _first_match(_PRICE_SL, text),

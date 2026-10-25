@@ -37,20 +37,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Load .env + install the corp-TLS workaround BEFORE data_provider is used, so
-# the backfill CLI actually sees ANGEL_* creds and can reach Angel. Without
-# this the CLI read only the OS environment, silently fell back to yfinance
-# even when Angel was configured (a train/serve fidelity trap), and would have
-# failed Angel's TLS on a TLS-inspecting network. Matches sim_dataset.py /
-# backtest.py, which already do this.
-from dotenv import load_dotenv
-load_dotenv()
-import ssl_dev  # noqa: E402
-ssl_dev.install_if_enabled()
+import pandas as pd
 
-import pandas as pd  # noqa: E402
-
-from constants import IST  # noqa: E402
+from constants import IST
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +320,16 @@ def _cli() -> None:
 
 
 if __name__ == "__main__":
+    # Load .env + install the corp-TLS workaround BEFORE data_provider is
+    # used, so the backfill CLI actually sees ANGEL_* creds and can reach
+    # Angel (without it the CLI silently fell back to yfinance — a train/serve
+    # fidelity trap). CLI-only: as an import side effect it re-injected ANGEL_*
+    # creds into every process whose first fetch_data() lazily imports this
+    # module for archiving (tests/tools that had removed them).
+    from dotenv import load_dotenv
+    load_dotenv()
+    import ssl_dev
+    ssl_dev.install_if_enabled()
     if sys.platform == "win32":
         try:
             sys.stdout.reconfigure(encoding="utf-8")

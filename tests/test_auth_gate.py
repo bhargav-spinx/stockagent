@@ -38,21 +38,59 @@ class _FakeMsg:
         self.sent.append(text)
 
 
+class _FakeChat:
+    def __init__(self, kind):
+        self.type = kind
+
+
 class _FakeUpdate:
-    def __init__(self, uid):
+    def __init__(self, uid, chat="private", edited=False):
         self.effective_user = _FakeUser(uid) if uid is not None else None
         self.effective_message = _FakeMsg()
+        self.effective_chat = _FakeChat(chat)
+        self.edited_message = self.effective_message if edited else None
+
+
+def _blocked(u) -> bool:
+    try:
+        asyncio.run(bot._auth_gate(u, None))
+        return False
+    except ApplicationHandlerStop:
+        return True
 
 
 def test_unauthorized_user_is_blocked_and_notified():
     bot.AUTHORIZED_USERS = {111}
+    bot._AUTH_NOTIFIED.clear()
     u = _FakeUpdate(222)
-    try:
-        asyncio.run(bot._auth_gate(u, None))
-        assert False, "expected ApplicationHandlerStop"
-    except ApplicationHandlerStop:
-        pass
+    assert _blocked(u), "expected ApplicationHandlerStop"
     assert u.effective_message.sent, "user should have been told they're blocked"
+
+
+def test_unauthorized_notice_is_sent_once_per_user():
+    bot.AUTHORIZED_USERS = {111}
+    bot._AUTH_NOTIFIED.clear()
+    first, second = _FakeUpdate(333), _FakeUpdate(333)
+    assert _blocked(first) and _blocked(second)
+    assert first.effective_message.sent and not second.effective_message.sent
+
+
+def test_unauthorized_in_group_is_blocked_silently():
+    # Group chatter (privacy mode off for tip capture) must not get a reply
+    # per message — still blocked, but silent.
+    bot.AUTHORIZED_USERS = {111}
+    bot._AUTH_NOTIFIED.clear()
+    g = _FakeUpdate(444, chat="supergroup")
+    assert _blocked(g)
+    assert not g.effective_message.sent
+
+
+def test_edited_messages_are_ignored():
+    # update.message is None for edits; handlers would crash on it.
+    bot.AUTHORIZED_USERS = {111}
+    e = _FakeUpdate(111, edited=True)
+    assert _blocked(e)
+    assert not e.effective_message.sent
 
 
 def test_authorized_user_passes_silently():

@@ -39,7 +39,7 @@ from telegram.request import HTTPXRequest
 
 from analyzer import (
     analyze, format_report, normalize_symbol,
-    signal_agreement, format_indicator_lines,
+    signal_agreement, format_indicator_lines, drop_forming_candle,
 )
 from config import CONFIG
 from features import (
@@ -116,6 +116,20 @@ async def _send_md(bot, chat_id: int, text: str, label: str = "push") -> bool:
         return False
 
 
+async def _reply_md(message, text: str, **kwargs) -> None:
+    """Command-reply twin of _send_md: Markdown first, plain text on failure.
+    /score appends raw Marketaux headlines and /stats prints channel names
+    (e.g. @nifty_calls) — one stray _ or * made Telegram reject the reply, and
+    for /score every later symbol in the loop was never delivered."""
+    try:
+        await message.reply_text(text, parse_mode="Markdown", **kwargs)
+        return
+    except Exception as e:
+        logger.warning("reply: Markdown rejected (%s: %s) — resending as plain "
+                       "text", type(e).__name__, e)
+    await message.reply_text(text, **kwargs)
+
+
 # ---------- Access control (personal-use allowlist) ----------
 # This bot gives BUY/SELL/target calls. Distributing those to others can bring it
 # under SEBI Research Analyst scope; leaving it open also invites resource abuse.
@@ -140,23 +154,36 @@ def _authorized_user_ids() -> set[int]:
 
 
 AUTHORIZED_USERS = _authorized_user_ids()
+_AUTH_NOTIFIED: set[int] = set()     # unauthorized users already told once
 
 
 async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs before every other handler (group=-1). If an allowlist is configured
     and the sender isn't on it, reply once and stop the update — keeping this a
     private, personal-use bot. No allowlist set ⇒ open mode (startup warns)."""
+    # Edited messages carry update.message=None; every handler reads
+    # update.message, so an edit used to surface as "Something went wrong".
+    if update.edited_message is not None:
+        raise ApplicationHandlerStop
     if not AUTHORIZED_USERS:
         return
     user = update.effective_user
     if user is None or user.id not in AUTHORIZED_USERS:
         logger.info("blocked unauthorized user_id=%s", getattr(user, "id", None))
-        try:
-            if update.effective_message:
-                await update.effective_message.reply_text(
-                    "🔒 Private bot — access is restricted to the owner.")
-        except Exception:
-            pass
+        # Reply only in a PRIVATE chat and only once per user per process: in
+        # groups (privacy mode off for tip capture) or channels the bot used to
+        # answer every member's message — flood-limited and noisy.
+        chat = update.effective_chat
+        uid = getattr(user, "id", None)
+        if (chat is not None and chat.type == "private" and uid is not None
+                and uid not in _AUTH_NOTIFIED):
+            _AUTH_NOTIFIED.add(uid)
+            try:
+                if update.effective_message:
+                    await update.effective_message.reply_text(
+                        "🔒 Private bot — access is restricted to the owner.")
+            except Exception:
+                pass
         raise ApplicationHandlerStop
 
 
@@ -365,7 +392,9 @@ async def angel_login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔐 Logging in to Angel One...")
     try:
-        info = force_angel_login()
+        # Blocking (login lock + 2 HTTP calls, ~7 s timeout each): on the event
+        # loop it froze polling, every background loop and Telethon.
+        info = await asyncio.to_thread(force_angel_login)
         await update.message.reply_text(
             f"✅ Angel One session active\nClient: {info.get('client_code')}"
         )
@@ -496,9 +525,9 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             news = await asyncio.to_thread(market_context.news_summary, r["symbol"])
             if news:
                 card_msg += "\n\n" + news
-        except Exception:
-            pass
-        await update.message.reply_text(card_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.debug("news for %s skipped: %s", r["symbol"], e)
+        await _reply_md(update.message, card_msg)
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -948,7 +977,8 @@ async def _autoscan_tick(app: Application) -> None:
     # would defeat the overlap guard above.
     _scan_task = asyncio.create_task(
         asyncio.to_thread(score_many, batch, idx,
-                          deadline_sec=AUTOSCAN_SCAN_BUDGET_SEC))
+                          deadline_sec=AUTOSCAN_SCAN_BUDGET_SEC,
+                          require_fresh=True))
     # Retrieve any exception from an abandoned (timed-out) pass so asyncio
     # doesn't log "Task exception was never retrieved".
     _scan_task.add_done_callback(
@@ -1093,7 +1123,10 @@ async def _autoscan_tick(app: Application) -> None:
             logger.info("autoscan: daily cap (%d) reached — suppressing further signals",
                         AUTOSCAN_MAX_DAILY)
             break
-        key = subscriptions.signal_key(c.symbol, "score", c.direction)
+        # Direction-agnostic: the old key included direction, so the same
+        # stock could fire LONG and later SHORT the same day (§6: one per
+        # stock per day).
+        key = subscriptions.signal_key(c.symbol, "score", "any")
         if subscriptions.already_fired(key):
             continue
         subscriptions.mark_fired(key)
@@ -1108,6 +1141,11 @@ async def _autoscan_tick(app: Application) -> None:
         try:
             p3df = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_data, c.symbol, "5d", "5m"), timeout=30)
+            # Same closed-candle frame the scorer and the sim replay see: one
+            # forming candle flipped inside_bar and moved p3_vx_curve 1.0→0.09,
+            # so the live shadow model was fed a different function than it
+            # was trained on.
+            p3df = drop_forming_candle(p3df, "5m")
             p3_feats = await asyncio.to_thread(
                 features.phase3_features, p3df, None, c.delivery_pct, c.direction)
         except Exception as e:
@@ -1259,7 +1297,7 @@ def _format_quiet_digest() -> str:
 async def _quiet_digest_tick(app: Application) -> None:
     """Send a once-per-day market-quiet digest if no signals fired by lunch."""
     now = datetime.now(IST)
-    if now.weekday() >= 5:
+    if not _is_trading_day(now):          # weekends AND NSE holidays
         return
     t = now.time()
     if not (QUIET_DIGEST_WINDOW[0] <= t < QUIET_DIGEST_WINDOW[1]):
@@ -1274,8 +1312,15 @@ async def _quiet_digest_tick(app: Application) -> None:
         subscriptions.mark_fired(key)
         return
 
-    # If we DID fire signals this morning, don't send the digest at all
-    if _today_signals_fired > 0:
+    # If we DID fire signals this morning, don't send the digest at all. The
+    # DB is the source of truth — the in-memory counter resets on a restart
+    # (and lunch has no scan ticks to rebuild it), which produced a false
+    # "scan loop may be stalled" digest after a midday restart.
+    try:
+        fired_today = len(subscriptions.get_alerts_for_date(category="scan"))
+    except Exception:
+        fired_today = 0
+    if _today_signals_fired > 0 or fired_today > 0:
         subscriptions.mark_fired(key)
         return
 
@@ -1872,7 +1917,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("stats_cmd failed: %s", e)
         await update.message.reply_text(f"❌ Stats build failed: {e}")
         return
-    await update.message.reply_text(report, parse_mode="Markdown")
+    await _reply_md(update.message, report)
 
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1889,7 +1934,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("today_cmd build_report failed: %s", e)
         await update.message.reply_text(f"❌ Report build failed: {e}")
         return
-    await update.message.reply_text(report, parse_mode="Markdown")
+    await _reply_md(update.message, report)
 
 
 def _is_eod_run_window(now: datetime | None = None) -> bool:
@@ -2093,7 +2138,12 @@ async def _heartbeat_tick(app: Application) -> None:
             logger.warning("heartbeat: Angel re-login failed: %s", e)
         active = angel_session_active()
 
-    if not active or dead_tasks:
+    import market_calendar
+    calendar_gap = market_calendar.coverage_warning(datetime.now(IST).date())
+    if calendar_gap:
+        logger.error("heartbeat: %s", calendar_gap)
+
+    if not active or dead_tasks or calendar_gap:
         recipients = set(subscriptions.get_subscribers()) | set(
             subscriptions.get_swing_subscribers())
         problems = []
@@ -2101,6 +2151,9 @@ async def _heartbeat_tick(app: Application) -> None:
             problems.append("the primary broker session is down")
         if dead_tasks:
             problems.append(f"these loops have died: {', '.join(dead_tasks)}")
+        if calendar_gap:
+            problems.append("the NSE holiday list is incomplete — update "
+                            "nse_holidays.txt from the NSE circular")
         warn = ("⚠️ *Bot health warning* — " + "; ".join(problems) + ". "
                 "Signals may be delayed or missing. "
                 + ("Restart the service to recover the dead loop(s)."
@@ -2256,8 +2309,10 @@ def _validate_config() -> None:
         except ValueError:
             raise SystemExit(f"PORT must be an integer (got: {os.getenv('PORT')!r}).")
         if not os.getenv("WEBHOOK_SECRET"):
-            logger.warning("WEBHOOK_SECRET is unset — using a guessable default "
-                           "path. Set WEBHOOK_SECRET to a random string.")
+            # The old guessable default ("tg-webhook") let anyone who found the
+            # URL forge updates — including ones claiming the owner's user id.
+            raise SystemExit("WEBHOOK_SECRET must be set (a long random string) "
+                             "when WEBHOOK_URL is set.")
 
     # Telethon is opt-in; warn (don't fail) if it's partially configured.
     tele = {k: os.getenv(k) for k in ("TELETHON_API_ID", "TELETHON_API_HASH",
@@ -2272,6 +2327,15 @@ def _validate_config() -> None:
         logger.warning("⚠️  DISABLE_SSL_VERIFY=true — TLS verification is OFF "
                        "globally. This is a local-dev workaround only; never run "
                        "with this enabled in production.")
+    if os.getenv("ANGEL_DISABLE_SSL", "").lower() in ("1", "true", "yes"):
+        logger.warning("⚠️  ANGEL_DISABLE_SSL=true — the Angel login (password + "
+                       "TOTP) is sent WITHOUT certificate verification. "
+                       "Local-dev only; never in production.")
+
+    import market_calendar
+    calendar_gap = market_calendar.coverage_warning()
+    if calendar_gap:
+        logger.error("⚠️  %s", calendar_gap)
 
     if not AUTHORIZED_USERS:
         logger.warning(
@@ -2385,7 +2449,7 @@ def main():
     webhook_url = os.getenv("WEBHOOK_URL")
     if webhook_url:
         port = int(os.getenv("PORT", "8080"))
-        secret = os.getenv("WEBHOOK_SECRET", "tg-webhook")
+        secret = os.environ["WEBHOOK_SECRET"]     # enforced by _validate_config
         logger.info("Bot starting in webhook mode on port %d", port)
         app.run_webhook(
             listen="0.0.0.0",

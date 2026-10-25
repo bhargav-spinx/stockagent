@@ -15,12 +15,13 @@ Fallback semantics — deliberate, not an accident:
 """
 
 import os
+import re
 import json
 import time
 import random
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 
 import pandas as pd
@@ -55,6 +56,74 @@ PERIOD_DAYS = {
     "6mo": 180, "1y": 365, "2y": 730,
 }
 
+_INTRADAY_INTERVALS = {"1m", "3m", "5m", "10m", "15m", "30m", "1h"}
+_PERIOD_RE = re.compile(r"^(\d+)(d|mo|y)$")
+
+
+def period_days(period: str) -> int:
+    """Calendar days for a yfinance-style period ("5d", "45d", "2mo", "1y").
+
+    Unknown periods RAISE. The old `PERIOD_DAYS.get(period, 180)` silently
+    turned every unlisted period (backtest's "10d"/"30d"/"2mo"/"4mo") into a
+    180-day window on Angel while yfinance honoured the request — the same
+    backtest ran on different windows per provider."""
+    if period in PERIOD_DAYS:
+        return PERIOD_DAYS[period]
+    m = _PERIOD_RE.match(period or "")
+    if not m:
+        raise ValueError(f"Unsupported period '{period}' (use Nd / Nmo / Ny)")
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"d": 1, "mo": 30, "y": 365}[unit]
+
+
+def _window_start(now: datetime, period: str, interval: str) -> datetime:
+    """Start of the Angel request window.
+
+    Intraday + "Nd" means N TRADING SESSIONS (today included once the market
+    has opened), starting at 00:00 IST of the earliest one — yfinance's "5d"
+    semantics, and exactly the 5-session frame sim_dataset replays
+    (LIVE_WINDOW_SESSIONS). The old `now - 5 calendar days` at the current
+    clock time returned only 3–4 sessions (weekends) with the OLDEST cut off
+    mid-day; rvol() matches sessions by candle position, so Mon–Wed morning
+    scans compared today's 09:15+ volume against that day's lighter 11:00+
+    candles (RVOL inflated ~11–16%, the 25-point score component)."""
+    days = period_days(period)
+    if interval not in _INTRADAY_INTERVALS:
+        return now - timedelta(days=days)
+    if _PERIOD_RE.match(period) and period.endswith("d"):
+        from market_calendar import is_trading_holiday
+        d = now.date()
+        if now.time() < dtime(9, 15):
+            d -= timedelta(days=1)         # today has no candles yet
+        counted = 0
+        while True:
+            if d.weekday() < 5 and not is_trading_holiday(d):
+                counted += 1
+                if counted >= days:
+                    break
+            d -= timedelta(days=1)
+        start = datetime.combine(d, dtime.min)
+        return IST.localize(start) if now.tzinfo else start
+    start = now - timedelta(days=days)
+    return start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _silence_sdk_logging() -> None:
+    """Stop the SmartApi SDK from writing credentials to disk/stderr.
+
+    On ANY failed request the SDK logs the full request headers + params at
+    ERROR level via logzero — for generateSession that is the client PASSWORD,
+    the TOTP and the X-PrivateKey (API key) — into ./logs/<date>/app.log
+    (never rotated) and stderr (journald on the VM). Every SmartConnect()
+    construction re-attaches that file handler, so this runs after each one.
+    Our own logger reports failures without the secrets."""
+    try:
+        import logzero
+        logzero.logfile(None)            # detach + close the SDK's app.log handler
+        logzero.logger.disabled = True   # the SDK's module-level logger object
+    except Exception as e:               # never let log hygiene break a login
+        logger.debug("could not silence SmartApi logging: %s", e)
+
 
 def _angel_login():
     """Authenticate to Angel One and return a SmartConnect session."""
@@ -80,12 +149,15 @@ def _angel_login():
     # overriding any requests.Session-level patch.
     disable_ssl = os.getenv("ANGEL_DISABLE_SSL", "").lower() in ("1", "true", "yes")
     smart = SmartConnect(api_key=api_key, disable_ssl=disable_ssl)
+    _silence_sdk_logging()
     totp = pyotp.TOTP(totp_secret).now()
     resp = smart.generateSession(client_code, password, totp)
     if not resp.get("status"):
         raise RuntimeError(f"Angel login failed: {resp.get('message')}")
 
-    logger.info("Angel One session established for client %s", client_code)
+    # Client code is the broker LOGIN ID — mask it; logs land in journald.
+    masked = f"{client_code[:2]}***{client_code[-2:]}" if len(client_code) > 4 else "***"
+    logger.info("Angel One session established for client %s", masked)
     return smart
 
 
@@ -99,6 +171,13 @@ _last_login_failure = 0.0            # time.monotonic() of the last failed login
 LOGIN_COOLDOWN_SEC = 60
 
 
+class AngelLoginCooldown(RuntimeError):
+    """Raised while the post-failure login cooldown is active. A distinct type
+    so the candle fetcher fails FAST on it — its message contains "login",
+    which the auth-marker heuristic used to treat as retryable (≈3–4.5 s of
+    backoff sleeps per symbol, enough to burn a whole scan tick's budget)."""
+
+
 def _get_angel_session():
     """Lazy-init / reuse the Angel session. Thread-safe; failed logins arm a
     cooldown so an outage can't turn into a login storm."""
@@ -110,7 +189,7 @@ def _get_angel_session():
             return _angel_session
         since_fail = time.monotonic() - _last_login_failure
         if since_fail < LOGIN_COOLDOWN_SEC:
-            raise RuntimeError(
+            raise AngelLoginCooldown(
                 f"Angel login on cooldown ({LOGIN_COOLDOWN_SEC - since_fail:.0f}s "
                 "left) after a recent failure — not retrying yet")
         try:
@@ -136,6 +215,22 @@ _AUTH_ERROR_MARKERS = ("token", "session", "login", "auth", "unauthor",
 def _looks_like_auth_error(exc: Exception) -> bool:
     s = str(exc).lower()
     return any(m in s for m in _AUTH_ERROR_MARKERS)
+
+
+# An expired/invalid session usually comes back as a NORMAL status:false JSON
+# body (e.g. {"errorcode": "AG8001", "message": "Invalid Token"}), not as an
+# exception. Matched strictly (error codes + explicit phrases) — a loose
+# "token" match would also hit "invalid symboltoken" and re-login per bad
+# symbol.
+_AUTH_ERROR_CODES = {"ag8001", "ag8002", "ag8003", "ab8050", "ab8051", "ab1010"}
+_AUTH_ERROR_PHRASES = ("invalid token", "token expired", "token missing",
+                       "session expired", "unauthor")
+
+
+def _is_auth_error_resp(resp: dict) -> bool:
+    code = str(resp.get("errorcode", "")).lower()
+    msg = str(resp.get("message", "")).lower()
+    return code in _AUTH_ERROR_CODES or any(p in msg for p in _AUTH_ERROR_PHRASES)
 
 
 def force_angel_login() -> dict:
@@ -196,6 +291,8 @@ def _get_candle_data(params: dict, label: str) -> dict:
     for attempt in range(CANDLE_MAX_RETRIES):
         try:
             resp = _get_angel_session().getCandleData(params)
+        except AngelLoginCooldown as e:
+            raise ValueError(f"No Angel data for {label}: {e}") from e
         except Exception as e:
             last_msg = str(e)
             if _looks_like_auth_error(e):
@@ -224,6 +321,15 @@ def _get_candle_data(params: dict, label: str) -> dict:
             return resp
 
         last_msg = str(resp.get("message"))
+        if _is_auth_error_resp(resp) and attempt < CANDLE_MAX_RETRIES - 1:
+            # Daily token expiry: without this the cached (dead) session was
+            # kept forever — every fetch failed until /angel_login or a
+            # restart, while angel_session_active() kept reporting True.
+            logger.warning("Angel session rejected for %s (%s %s) — dropping "
+                           "session and re-logging in", label,
+                           resp.get("errorcode"), last_msg)
+            _reset_angel_session()
+            continue
         if _is_rate_limited(resp) and attempt < CANDLE_MAX_RETRIES - 1:
             # Jittered exponential backoff — desynchronizes retries if scans
             # ever run concurrently (e.g. manual /scan during the auto loop).
@@ -258,11 +364,27 @@ def _load_scrip_master():
             needs_download = False
 
     if needs_download:
-        import requests
-        logger.info("Downloading Angel scrip master (~10 MB)...")
-        r = requests.get(SCRIP_MASTER_URL, timeout=60)
-        r.raise_for_status()
-        SCRIP_MASTER_PATH.write_text(r.text, encoding="utf-8")
+        try:
+            import requests
+            logger.info("Downloading Angel scrip master (~10 MB)...")
+            r = requests.get(SCRIP_MASTER_URL, timeout=60)
+            r.raise_for_status()
+            data = json.loads(r.text)          # validate BEFORE replacing the cache
+            if not isinstance(data, list) or len(data) < 1000:
+                raise ValueError("implausible scrip master payload")
+            # Atomic replace: a truncated/HTML body must never poison the cache.
+            tmp = SCRIP_MASTER_PATH.with_name(SCRIP_MASTER_PATH.name + ".tmp")
+            tmp.write_text(r.text, encoding="utf-8")
+            os.replace(tmp, SCRIP_MASTER_PATH)
+            _scrip_master = data
+            return _scrip_master
+        except Exception as e:
+            if not SCRIP_MASTER_PATH.exists():
+                raise
+            # A stale-but-valid map beats failing every stock fetch (and
+            # re-attempting a 60 s download per symbol) for the whole day.
+            logger.warning("Scrip master refresh failed (%s) — using the stale "
+                           "cached copy", e)
 
     with open(SCRIP_MASTER_PATH, "r", encoding="utf-8") as f:
         _scrip_master = json.load(f)
@@ -273,13 +395,16 @@ def _resolve_token(symbol: str):
     """Map ticker like 'RELIANCE' or 'TCS.BO' to Angel (token, exchange, tradingsymbol)."""
     sym = symbol.upper().strip()
     if sym.endswith(".BO"):
-        exch, base = "BSE", sym[:-3]
+        # Angel's BSE cash rows carry NO -EQ suffix ("RELIANCE", token 500325)
+        # and an empty instrumenttype — the old "{base}-EQ" lookup matched
+        # none of them, so every .BO request failed.
+        exch, target, bse = "BSE", sym[:-3], True
     else:
-        exch, base = "NSE", sym.replace(".NS", "")
+        exch, target, bse = "NSE", f"{sym.replace('.NS', '')}-EQ", False
 
-    target = f"{base}-EQ"
     for s in _load_scrip_master():
-        if s.get("exch_seg") == exch and s.get("symbol") == target:
+        if (s.get("exch_seg") == exch and s.get("symbol") == target
+                and (not bse or not s.get("instrumenttype"))):
             return s["token"], exch, s["symbol"]
     raise ValueError(f"'{symbol}' not found in Angel scrip master (looked for {target} on {exch})")
 
@@ -300,7 +425,7 @@ def _fetch_angel_by_token(exchange: str, token: str, period: str, interval: str,
 
     now = datetime.now(IST)
     if start is None:
-        start = now - timedelta(days=PERIOD_DAYS.get(period, 180))
+        start = _window_start(now, period, interval)
     end = end or now
     params = {
         "exchange": exchange,
@@ -341,8 +466,6 @@ def fetch_angel(symbol: str, period: str, interval: str) -> pd.DataFrame:
     if not angel_interval:
         raise ValueError(f"Interval '{interval}' not supported by Angel One. "
                          f"Supported: {', '.join(ANGEL_INTERVALS)}")
-    days = PERIOD_DAYS.get(period, 180)
-
     token, exch, _ = _resolve_token(symbol)
 
     now = datetime.now(IST)
@@ -350,7 +473,7 @@ def fetch_angel(symbol: str, period: str, interval: str) -> pd.DataFrame:
         "exchange": exch,
         "symboltoken": token,
         "interval": angel_interval,
-        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+        "fromdate": _window_start(now, period, interval).strftime("%Y-%m-%d %H:%M"),
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -442,6 +565,10 @@ def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.Dat
     fail the fetch, and ARCHIVE_DISABLED=true turns it off.
     """
     df, source = _fetch_routed(symbol, period, interval)
+    # Provenance travels with the frame: displays must show the source that
+    # ACTUALLY served the data (an index can fall back to delayed yfinance
+    # while get_provider_name() still says "Angel One").
+    df.attrs["source"] = source
     try:
         import data_archive
         data_archive.archive_fetch(symbol, interval, df, source)

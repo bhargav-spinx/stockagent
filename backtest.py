@@ -72,6 +72,35 @@ logger = logging.getLogger(__name__)
 # Min candles required before any setup can fire (indicator warm-up)
 MIN_WARMUP_CANDLES = 30
 
+# Replay fidelity — single source for backtest.py AND sim_dataset.py:
+# - BAR: a decision on the candle starting at ts is only actionable at its
+#   CLOSE (ts + BAR). Live stamps alerts after the close, so the resolver
+#   skips the trigger candle; replays that passed the candle START re-checked
+#   the trigger candle's own high/low (which happened BEFORE the entry at its
+#   close) — instant sl_hit on any wide breakout bar, wick-polluted MAE/MFE,
+#   and a time-stop ~5 min early. The entry-window check uses the same
+#   decision time live uses (wall clock ≥ candle close).
+# - LIVE_WINDOW_SESSIONS: the live scan fetches "5d" = 5 sessions, so every
+#   live feature (RVOL baseline, gap, volume curve) sees ≈5 sessions. Feeding
+#   the scorer the whole history made the backtest RVOL a different variable
+#   (baseline growing from ~7 to ~37 sessions across a walk-forward fold).
+BAR = timedelta(minutes=5)
+LIVE_WINDOW_SESSIONS = 5
+
+
+def live_window_starts(df: pd.DataFrame) -> list[int]:
+    """For each row, the iloc where its live-equivalent window begins: the
+    first candle of the session LIVE_WINDOW_SESSIONS-1 sessions earlier."""
+    first: dict = {}
+    order: list = []
+    for j, d in enumerate(df.index.date):
+        if d not in first:
+            first[d] = j
+            order.append(d)
+    pos = {d: k for k, d in enumerate(order)}
+    back = LIVE_WINDOW_SESSIONS - 1
+    return [first[order[max(0, pos[d] - back)]] for d in df.index.date]
+
 
 # ---------- data structures ----------
 
@@ -184,18 +213,21 @@ class BacktestStats:
 
 # ---------- core walk-forward ----------
 
-def _filters_with_atr_override(df, direction: str, atr_lo: float, atr_hi: float):
-    """Run universal filters but with a custom ATR band. Used by backtest tuning."""
+def _filters_with_atr_override(df, direction: str | None, atr_lo: float, atr_hi: float):
+    """Run universal filters but with a custom ATR band. Used by backtest tuning.
+    direction=None = the direction-neutral pre-pass (no round-number gate)."""
     from scanner_filters import (
         FilterResult, atr_bounds_filter, trigger_volume_filter,
         vwap_slope_filter, round_number_filter,
     )
-    for f in [
+    checks = [
         atr_bounds_filter(df, lo=atr_lo, hi=atr_hi),
         trigger_volume_filter(df),
         vwap_slope_filter(df),
-        round_number_filter(df, direction),
-    ]:
+    ]
+    if direction is not None:
+        checks.append(round_number_filter(df, direction))
+    for f in checks:
         if not f.passed:
             return f
     return FilterResult(True)
@@ -289,16 +321,18 @@ def _simulate_setups(df: pd.DataFrame, sym: str,
     filter_rejections: dict[str, int] = {}
     candles_in_window = 0
 
+    win_start = live_window_starts(df)
     for i in range(MIN_WARMUP_CANDLES, len(df)):
-        slice_df = df.iloc[: i + 1]
+        slice_df = df.iloc[win_start[i]: i + 1]
         ts = slice_df.index[-1].to_pydatetime()
+        decided_at = ts + BAR
 
         cur_date = ts.date()
         if cur_date != last_session_date:
             fired_today.clear()
             last_session_date = cur_date
 
-        if not is_intraday_entry_window(ts):
+        if not is_intraday_entry_window(decided_at):
             continue
         if entry_dates is not None and cur_date not in entry_dates:
             continue
@@ -306,12 +340,12 @@ def _simulate_setups(df: pd.DataFrame, sym: str,
 
         if atr_lo is not None or atr_hi is not None:
             f = _filters_with_atr_override(
-                slice_df, direction="long",
+                slice_df, direction=None,
                 atr_lo=atr_lo if atr_lo is not None else 0.004,
                 atr_hi=atr_hi if atr_hi is not None else 0.015,
             )
         else:
-            f = apply_universal_filters(slice_df, direction="long", check_time=False)
+            f = apply_universal_filters(slice_df, direction=None, check_time=False)
         if not f.passed:
             bucket = f.reason.split("(")[0].split("<")[0].split(">")[0].strip()[:40]
             filter_rejections[bucket] = filter_rejections.get(bucket, 0) + 1
@@ -336,8 +370,8 @@ def _simulate_setups(df: pd.DataFrame, sym: str,
                 continue
             fired_today.add(key)
 
-            outcome = _resolve_outcome(sig, ts, df)
-            if outcome.get("status") == "no_data":
+            outcome = _resolve_outcome(sig, decided_at, df)
+            if outcome.get("status") in ("open", "no_data"):
                 continue
             trades.append(Trade(
                 symbol=sig.symbol, setup=sig.setup, direction=sig.direction,
@@ -362,10 +396,12 @@ def _simulate_score(df: pd.DataFrame, sym: str, min_score: int = 90,
     trades: list[Trade] = []
     fired_days: set = set()
     candles_in_window = 0
+    win_start = live_window_starts(df)
     for i in range(MIN_WARMUP_CANDLES, len(df)):
-        slice_df = df.iloc[: i + 1]
+        slice_df = df.iloc[win_start[i]: i + 1]
         ts = slice_df.index[-1].to_pydatetime()
-        if not is_intraday_entry_window(ts):
+        decided_at = ts + BAR
+        if not is_intraday_entry_window(decided_at):
             continue
         d = ts.date()
         if entry_dates is not None and d not in entry_dates:
@@ -382,7 +418,7 @@ def _simulate_score(df: pd.DataFrame, sym: str, min_score: int = 90,
         alert = {
             "symbol": sym, "entry": card.entry, "stop_loss": card.stop_loss,
             "target1": card.target1, "target2": card.target2,
-            "direction": card.direction, "generated_at": ts,
+            "direction": card.direction, "generated_at": decided_at,
         }
         outcome = eod_report.resolve_intraday(alert, df=df)
         if outcome.get("status") in (None, "open", "no_data"):

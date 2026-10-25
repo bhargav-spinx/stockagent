@@ -170,7 +170,9 @@ def numeric_feature_keys(rows: list[dict], min_pairs: int = MIN_FEATURE_PAIRS) -
     counts: dict[str, int] = {}
     for r in rows:
         for k, v in (r.get("features") or {}).items():
-            if _is_number(v):
+            # shadow_* is the model's own logged prediction, not an input
+            # feature — ranking it here would grade the model by itself.
+            if _is_number(v) and not k.startswith("shadow_"):
                 counts[k] = counts.get(k, 0) + 1
     return sorted(k for k, c in counts.items() if c >= min_pairs)
 

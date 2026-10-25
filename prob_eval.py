@@ -37,7 +37,7 @@ from typing import Any, Sequence
 import numpy as np
 
 import sim_dataset
-from prob_model import LogisticModel, select_numeric_columns
+from prob_model import LogisticModel, model_features, select_numeric_columns
 
 logger = logging.getLogger(__name__)
 
@@ -118,15 +118,29 @@ def reliability_table(y: Sequence[int], p: Sequence[float],
 def _top_k_stats(rows: list[dict], key_values: Sequence[float],
                  frac: float) -> dict:
     """Realized win rate / mean R of the top `frac` rows ranked by key_values
-    (desc). Deterministic tie-break by row ts."""
+    (desc), with ties at the cut-off counted FRACTIONALLY.
+
+    The score moves in 5-point steps, so the top-10% cut lands inside a block
+    of tied rows; a timestamp tie-break filled that block with the OLDEST
+    rows, and on a no-signal synthetic set the baseline swung 8.5%–12.5%
+    depending on tie order — the size of the 2-point beats-score gate itself.
+    Each row in the boundary tie block now contributes (slots left / block
+    size): the expected value over all tie orderings."""
     k = max(1, int(len(rows) * frac))
-    order = sorted(range(len(rows)),
-                   key=lambda i: (-float(key_values[i]), rows[i]["ts"]))
-    top = [rows[i] for i in order[:k]]
-    wins = sum(r["label_win"] for r in top)
-    rs = [r["r_multiple"] for r in top if r["r_multiple"] is not None]
+    vals = [float(v) for v in key_values]
+    order = sorted(range(len(rows)), key=lambda i: -vals[i])
+    cut = vals[order[k - 1]]
+    above = [i for i in order if vals[i] > cut]
+    tied = [i for i in order if vals[i] == cut]
+    w_tied = (k - len(above)) / len(tied)
+    weights = [(i, 1.0) for i in above] + [(i, w_tied) for i in tied]
+    wins = sum(w * rows[i]["label_win"] for i, w in weights)
+    r_pairs = [(w, rows[i]["r_multiple"]) for i, w in weights
+               if rows[i]["r_multiple"] is not None]
+    r_w = sum(w for w, _ in r_pairs)
+    mean_r = (sum(w * r for w, r in r_pairs) / r_w) if r_w else None
     return {"k": k, "win_rate": round(wins / k, 4),
-            "mean_r": round(float(np.mean(rs)), 4) if rs else None}
+            "mean_r": round(float(mean_r), 4) if mean_r is not None else None}
 
 
 # ---------- purged walk-forward ----------
@@ -170,7 +184,8 @@ def evaluate(rows: list[dict] | None = None, *, n_folds: int = DEFAULT_FOLDS,
         test = [r for r in rows if r["trade_date"] in test_dates]
         if len(train) < 20 or len(test) < 5:
             continue
-        cols = select_numeric_columns([r["features"] for r in train])
+        cols = select_numeric_columns(
+            [model_features(r["features"]) for r in train])
         if not cols:
             continue
         model = LogisticModel().fit([r["features"] for r in train],
@@ -182,10 +197,22 @@ def evaluate(rows: list[dict] | None = None, *, n_folds: int = DEFAULT_FOLDS,
         oos_y.extend(y)
         oos_p.extend(p)
         oos_rows.extend(test)
+        # Coverage diagnostics: a fold whose test window holds only a handful
+        # of symbols (e.g. an archive backfilled in two disjoint windows) is a
+        # different population — visible here instead of hidden in the pool.
         fold_reports.append({
             "fold": f_idx, "n_train": len(train), "n_test": len(test),
+            "test_dates": (min(test_dates), max(test_dates)),
+            "test_symbols": len({r["symbol"] for r in test}),
             "embargoed_sessions": test_start_pos - embargo_cut,
+            "base_rate": round(float(np.mean(y)), 4),
+            "mean_p": round(float(np.mean(p)), 4),
             "auc": auc(y, p), "brier_skill": brier_skill(y, p),
+            # Is the pooled "beats the score" result stable fold by fold, or
+            # carried by one period? (sign persistence, not just a pooled mean)
+            "top10_model_win": _top_k_stats(test, p, 0.10)["win_rate"],
+            "top10_score_win": _top_k_stats(
+                test, [float(r["score"]) for r in test], 0.10)["win_rate"],
         })
 
     if not oos_rows:
@@ -272,6 +299,81 @@ def train_final(out_path: str | Path, *, lam: float = DEFAULT_LAM,
     return model
 
 
+# ---------- forward test of a FROZEN artifact ----------
+
+def forward_test(model_path: str | Path, *, since: str | None = None,
+                 decisive_only: bool = False) -> dict[str, Any]:
+    """Score sessions the saved artifact NEVER saw — no refitting, no column
+    re-selection, no tuning. Walk-forward CV still re-fits on each fold; this
+    is the stricter monthly check: does the exact model now running in shadow
+    keep its ranking on genuinely new data? `since` defaults to the last
+    trade date in the artifact's training set (model card)."""
+    model = LogisticModel.load(model_path)
+    if since is None:
+        span = (model.meta.get("dataset") or {}).get("date_range") or [None, None]
+        since = span[1]
+    if not since:
+        raise SystemExit("artifact has no training date range in its model card "
+                         "— pass --since YYYY-MM-DD")
+    rows = [r for r in sim_dataset.load_rows(decisive_only=decisive_only)
+            if r["trade_date"] > since]
+    if len(rows) < 10:
+        return {"underpowered": True, "n_rows": len(rows), "since": since,
+                "note": f"only {len(rows)} row(s) after {since} — generate the "
+                        "newer sessions first (sim_dataset.py generate)"}
+    p = model.predict_proba_many([r["features"] for r in rows])
+    y = [r["label_win"] for r in rows]
+    baseline = {}
+    for frac in TOP_FRACS:
+        by_model = _top_k_stats(rows, p, frac)
+        by_score = _top_k_stats(rows, [float(r["score"]) for r in rows], frac)
+        baseline[f"top_{int(frac * 100)}pct"] = {
+            "model": by_model, "score_baseline": by_score,
+            "model_beats_score": (by_model["win_rate"]
+                                  >= by_score["win_rate"] + MIN_BASELINE_EDGE),
+        }
+    bss, a = brier_skill(y, p), auc(y, p)
+    return {
+        "underpowered": len(rows) < MIN_POOLED_OOS,
+        "since": since,
+        "dates": (min(r["trade_date"] for r in rows),
+                  max(r["trade_date"] for r in rows)),
+        "n_rows": len(rows),
+        "symbols": len({r["symbol"] for r in rows}),
+        "base_rate": round(float(np.mean(y)), 4),
+        "mean_p": round(float(np.mean(p)), 4),
+        "brier_skill": round(bss, 4) if bss is not None else None,
+        "auc": round(a, 4) if a is not None else None,
+        "reliability": reliability_table(y, p, n_bins=10 if len(rows) >= 200 else 5),
+        "baseline_comparison": baseline,
+        "model_trained_at": model.trained_at,
+        "feature_transform": model.transform,
+    }
+
+
+def _print_forward(rep: dict) -> None:
+    if rep.get("note"):
+        print(f"FORWARD TEST: {rep['note']}")
+        return
+    stamp = "  ⚠ UNDERPOWERED — provisional" if rep["underpowered"] else ""
+    print(f"FORWARD TEST of frozen artifact (trained {rep['model_trained_at'][:10]}, "
+          f"transform v{rep['feature_transform']}){stamp}")
+    print(f"unseen sessions {rep['dates'][0]} → {rep['dates'][1]} (after {rep['since']})  "
+          f"rows={rep['n_rows']}  symbols={rep['symbols']}")
+    print(f"base {rep['base_rate']:.2%} vs mean predicted {rep['mean_p']:.2%}  "
+          f"AUC {rep['auc']}  Brier skill {rep['brier_skill']}")
+    print("\nReliability (predicted → realized):")
+    for b in rep["reliability"]:
+        print(f"  {b['bin']}: n={b['n']:<5} mean_p={b['mean_p']:.2f} "
+              f"→ win {b['win_rate']:.2%}")
+    print("\nModel ranking vs 100-pt score ranking (same unseen rows):")
+    for k, v in rep["baseline_comparison"].items():
+        m, s = v["model"], v["score_baseline"]
+        verdict = "BEATS" if v["model_beats_score"] else "does NOT beat"
+        print(f"  {k}: model win {m['win_rate']:.2%} (R {m['mean_r']}) vs "
+              f"score win {s['win_rate']:.2%} (R {s['mean_r']}) — {verdict}")
+
+
 # ---------- CLI ----------
 
 def _print_report(rep: dict) -> None:
@@ -284,6 +386,15 @@ def _print_report(rep: dict) -> None:
           f"base rate={rep['oos_base_rate']:.2%}")
     print(f"Brier {rep['pooled_brier']}  skill {rep['pooled_brier_skill']}  "
           f"AUC {rep['pooled_auc']}  ({rep['optimizations']} fits)")
+    print("\nFolds (test window · symbols · base rate vs mean predicted p):")
+    for f in rep["folds"]:
+        a = f"{f['auc']:.3f}" if f["auc"] is not None else "n/a"
+        bss = f"{f['brier_skill']:+.3f}" if f["brier_skill"] is not None else "n/a"
+        print(f"  fold {f['fold']}: {f['test_dates'][0]} → {f['test_dates'][1]}  "
+              f"n={f['n_test']:<4} symbols={f['test_symbols']:<3} "
+              f"base {f['base_rate']:.1%} vs pred {f['mean_p']:.1%}  "
+              f"AUC {a}  skill {bss}  "
+              f"top10 model {f['top10_model_win']:.1%} / score {f['top10_score_win']:.1%}")
     print("\nReliability (predicted → realized):")
     for b in rep["reliability"]:
         print(f"  {b['bin']}: n={b['n']:<5} mean_p={b['mean_p']:.2f} "
@@ -313,11 +424,19 @@ def _cli() -> None:
     tr.add_argument("--lam", type=float, default=DEFAULT_LAM)
     tr.add_argument("--decisive-only", action="store_true")
     tr.add_argument("--min-score", type=int, default=None)
+    fw = sub.add_parser("forward", help="score a frozen artifact on unseen sessions")
+    fw.add_argument("--model", default="models/prob_v1.json")
+    fw.add_argument("--since", default=None,
+                    help="YYYY-MM-DD; default = artifact's last training date")
+    fw.add_argument("--decisive-only", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    if args.cmd == "evaluate":
+    if args.cmd == "forward":
+        _print_forward(forward_test(args.model, since=args.since,
+                                    decisive_only=args.decisive_only))
+    elif args.cmd == "evaluate":
         _print_report(evaluate(n_folds=args.folds,
                                embargo_sessions=args.embargo, lam=args.lam,
                                decisive_only=args.decisive_only,

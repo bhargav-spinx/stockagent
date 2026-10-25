@@ -2,29 +2,40 @@
 # Format: one ISO date (YYYY-MM-DD) per line. Inline "# comment" is allowed.
 # Blank lines and lines starting with # are ignored.
 #
-# PRE-FILLED: only FIXED-date holidays (always on the same Gregorian date).
-# YOU MUST ADD the variable/lunar 2026 holidays (Holi, Eid/Ramzan Id, Ram Navami,
-# Good Friday, Bakri Id, Muharram, Ganesh Chaturthi, Dussehra, Diwali Laxmi Pujan,
-# Diwali Balipratipada, Guru Nanak Jayanti, etc.) from the official NSE circular:
-#   https://www.nseindia.com/resources/exchange-communication-holidays
+# Source: official NSE holiday circular for the Equity / Equity-Derivatives
+# segment: https://www.nseindia.com/resources/exchange-communication-holidays
+# UPDATE EVERY DECEMBER when NSE publishes next year's list. The bot logs an
+# ERROR (and the heartbeat warns) when the current year has too few entries —
+# a missing weekday holiday makes every scan/EOD run on stale candles.
 # Including a date that lands on a weekend is harmless (weekends are skipped anyway).
 
-# ---- Fixed-date holidays ----
+# ---- 2026 (NSE circular; weekday closures) ----
+2026-01-15   # Municipal Corporation Election - Maharashtra
 2026-01-26   # Republic Day
+2026-03-03   # Holi
+2026-03-26   # Shri Ram Navami
+2026-03-31   # Shri Mahavir Jayanti
+2026-04-03   # Good Friday
+2026-04-14   # Dr. Baba Saheb Ambedkar Jayanti
 2026-05-01   # Maharashtra Day
-2026-08-15   # Independence Day
-2026-10-02   # Gandhi Jayanti
+2026-05-28   # Bakri Id
+2026-06-26   # Muharram
+2026-09-14   # Ganesh Chaturthi
+2026-10-02   # Mahatma Gandhi Jayanti
+2026-10-20   # Dussehra
+2026-11-10   # Diwali - Balipratipada
+2026-11-24   # Prakash Gurpurb Sri Guru Nanak Dev
 2026-12-25   # Christmas
+# 2026 holidays falling on weekends (no effect; listed for completeness):
+2026-02-15   # Mahashivratri (Sun)
+2026-03-21   # Id-Ul-Fitr (Sat)
+2026-08-15   # Independence Day (Sat)
+2026-11-08   # Diwali Laxmi Pujan (Sun) — Muhurat session; the bot does not scan it
 
-# ---- Variable/lunar 2026 holidays — VERIFY against NSE circular, then add below ----
-# 2026-MM-DD   # Holi
-# 2026-MM-DD   # Ramzan Id (Eid-ul-Fitr)
-# 2026-MM-DD   # Ram Navami
-# 2026-MM-DD   # Good Friday
-# 2026-MM-DD   # Bakri Id (Eid-ul-Adha)
-# 2026-MM-DD   # Muharram
-# 2026-MM-DD   # Ganesh Chaturthi
-# 2026-MM-DD   # Dussehra
-# 2026-MM-DD   # Diwali — Laxmi Pujan (special muhurat session may still run)
-# 2026-MM-DD   # Diwali — Balipratipada
-# 2026-MM-DD   # Guru Nanak Jayanti
+# ---- 2027 — FIXED-date holidays only; ADD the variable/lunar dates from the
+# ---- NSE 2027 circular as soon as it is published (Dec 2026) ----
+2027-01-26   # Republic Day
+2027-05-01   # Maharashtra Day (Sat)
+2027-08-15   # Independence Day (Sun)
+2027-10-02   # Mahatma Gandhi Jayanti (Sat)
+2027-12-25   # Christmas (Sat)

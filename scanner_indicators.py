@@ -3,6 +3,8 @@ Intraday-specific indicators + shared intraday utilities used by the scanner,
 the setup detectors, and the scoring engine.
 Reuses analyzer.py for atr/rsi/macd/bollinger.
 """
+from datetime import datetime, timedelta
+
 import pandas as pd
 
 from config import CONFIG
@@ -51,7 +53,16 @@ def vwap_slope_pct(vwap_series: pd.Series, lookback: int = 6) -> float | None:
     - Positive  → uptrend
     - Negative  → downtrend
     - Near zero → flat (chop, no trade)
+
+    Computed on TODAY's VWAP only: VWAP resets each session, so a regression
+    spanning the overnight reset (the 09:35/09:40 scans, exactly when ORB
+    setups trigger) measured the jump from yesterday's VWAP — a dead-flat
+    session after a 1% gap read as a 0.2%/candle "trend" and passed the
+    not-flat filter. Returns None until today has `lookback` values.
     """
+    idx = vwap_series.index
+    if len(vwap_series) and isinstance(idx, pd.DatetimeIndex):
+        vwap_series = vwap_series[idx.date == idx[-1].date()]
     recent = vwap_series.tail(lookback).dropna()
     if len(recent) < lookback:
         return None
@@ -77,37 +88,43 @@ def supertrend(df: pd.DataFrame, period: int = 10,
     Supertrend indicator. Returns (line, direction) where direction is
     +1 (bullish / price above the line) or -1 (bearish / below).
 
-    Standard ATR-band implementation with band-locking carry-forward.
+    Standard final-band recursion (TradingView ta.supertrend):
+      final_upper = basic_upper if basic_upper < prev_final_upper or
+                    prev_close > prev_final_upper, else prev_final_upper
+      final_lower = basic_lower if basic_lower > prev_final_lower or
+                    prev_close < prev_final_lower, else prev_final_lower
+    Direction flips when the close crosses the CURRENT final band on the
+    active side. (The previous version applied max/min exactly in the reset
+    case and never ratcheted otherwise, so direction almost never left its
+    initial +1 — "bullish" at the end of a steady −26% decline.)
     """
     from analyzer import atr as atr_fn
 
     atr = atr_fn(df, period)
     hl2 = (df["High"] + df["Low"]) / 2
-    upper = hl2 + multiplier * atr
-    lower = hl2 - multiplier * atr
+    upper = (hl2 + multiplier * atr).to_numpy(dtype=float)
+    lower = (hl2 - multiplier * atr).to_numpy(dtype=float)
 
-    close = df["Close"].to_numpy()
-    up = upper.to_numpy()
-    lo = lower.to_numpy()
+    close = df["Close"].to_numpy(dtype=float)
     n = len(df)
+    fu = upper.copy()
+    fl = lower.copy()
     line = [float("nan")] * n
     direction = [1] * n
 
     for i in range(1, n):
-        # Tighten bands: the band only moves in the trend's favour.
-        if close[i - 1] > up[i - 1]:
-            up[i] = max(up[i], up[i - 1])
-        if close[i - 1] < lo[i - 1]:
-            lo[i] = min(lo[i], lo[i - 1])
-
-        prev_dir = direction[i - 1]
-        if close[i] > up[i - 1]:
-            direction[i] = 1
-        elif close[i] < lo[i - 1]:
-            direction[i] = -1
-        else:
-            direction[i] = prev_dir
-        line[i] = lo[i] if direction[i] == 1 else up[i]
+        if upper[i] != upper[i] or fu[i - 1] != fu[i - 1]:   # NaN ATR warm-up
+            direction[i] = direction[i - 1]
+            continue
+        fu[i] = (upper[i] if (upper[i] < fu[i - 1] or close[i - 1] > fu[i - 1])
+                 else fu[i - 1])
+        fl[i] = (lower[i] if (lower[i] > fl[i - 1] or close[i - 1] < fl[i - 1])
+                 else fl[i - 1])
+        if direction[i - 1] == -1:            # line was the upper band
+            direction[i] = 1 if close[i] > fu[i] else -1
+        else:                                 # line was the lower band
+            direction[i] = -1 if close[i] < fl[i] else 1
+        line[i] = fl[i] if direction[i] == 1 else fu[i]
 
     return (pd.Series(line, index=df.index),
             pd.Series(direction, index=df.index))
@@ -136,6 +153,30 @@ def localize_ist(df: pd.DataFrame) -> pd.DataFrame:
     if str(df.index.tz) != str(IST):
         return df.tz_convert(IST)
     return df
+
+
+# Max age of the last CLOSED candle before a live signal is refused. Generous
+# enough for the ~15-min-delayed yfinance dev path; tight enough to reject the
+# real failure modes: a holiday missing from nse_holidays.txt, a lagging feed,
+# a halted stock — all of which otherwise score YESTERDAY's session ("today"
+# is just the last date in the data) and stamp it with today's date.
+MAX_CANDLE_LAG = timedelta(minutes=30)
+
+
+def stale_reason(df: pd.DataFrame, interval_min: int = 5,
+                 now: datetime | None = None) -> str | None:
+    """Why `df`'s last candle is too old to act on at `now`, or None if fresh.
+    For LIVE signal paths only (backtests replay history by definition)."""
+    if df is None or len(df) == 0:
+        return "no candles"
+    now = now or datetime.now(IST)
+    last = localize_ist(df).index[-1].to_pydatetime()
+    if last.date() != now.date():
+        return f"no candles today yet (last {last:%d %b %H:%M})"
+    lag = now - (last + timedelta(minutes=interval_min))
+    if lag > MAX_CANDLE_LAG:
+        return f"stale data (last candle closed {int(lag.total_seconds() // 60)} min ago)"
+    return None
 
 
 def today_session(df: pd.DataFrame) -> pd.DataFrame:

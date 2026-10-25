@@ -80,15 +80,38 @@ def _score_of(row: dict[str, Any]) -> int | None:
     return None
 
 
+def _dedupe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per distinct call: (category, symbol, direction, trade_date,
+    entry). swing_auto is logged once PER SUBSCRIBER and manual /swing or
+    /intraday once per query, so the same trade appeared k times — inflating
+    n, and the t-stat by ~√k, and narrowing the CI. Keeps the first copy."""
+    seen, out = set(), []
+    for r in rows:
+        try:
+            direction = eod_report._norm_direction(r.get("direction"))
+        except ValueError:
+            direction = str(r.get("direction"))
+        key = (r.get("category"), r.get("symbol"), direction,
+               r.get("trade_date"), round(float(r.get("entry") or 0), 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def build_stats_report() -> str:
     """System-wide realized-performance report across all resolved alerts."""
-    # Resolve anything still pending so the numbers are current.
+    # Resolve anything still pending so the numbers are current. Same window
+    # as the EOD job — the old 60 vs 30 mismatch meant /stats and the EOD
+    # report could disagree on which old swing calls ever resolved.
     try:
-        eod_report.resolve_pending(max_age_days=60)
-    except Exception:
-        pass
+        eod_report.resolve_pending(max_age_days=eod_report.RESOLVE_MAX_AGE_DAYS)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("stats: resolve_pending failed: %s", e)
 
-    rows = subscriptions.get_resolved_alerts(ALL_CATEGORIES)
+    rows = _dedupe(subscriptions.get_resolved_alerts(ALL_CATEGORIES))
     if not rows:
         return ("📈 *Performance stats*\n\n_No resolved recommendations yet._\n"
                 "Stats appear here once alerts have run their course "
@@ -96,6 +119,10 @@ def build_stats_report() -> str:
 
     by_cat = {c: [r for r in rows if r["category"] == c] for c in ALL_CATEGORIES}
     scan_rows = by_cat.get("scan", [])
+    # "All" = the BOT's own calls. channel_call rows are a third party's
+    # levels — mixing them in made the headline Sharpe/CI partly someone
+    # else's track record. They keep their own lines below.
+    own_rows = [r for r in rows if r["category"] != "channel_call"]
 
     cost_note = (f"~{COST_PER_TRADE_PCT:.2f}% round-trip"
                  if eod_report.CONFIG.costs.model == "flat"
@@ -104,9 +131,9 @@ def build_stats_report() -> str:
         "📈 *Performance stats* — realized outcomes\n",
         f"_Net of {cost_note}. Win rate over "
         "decisive (W+L) trades only._\n",
-        "*Overall*",
-        _line("All", _agg(rows)),
-        riskmetrics.format_line(_net_returns(rows), "Risk-adj"),
+        "*Overall* (the bot's own calls)",
+        _line("All", _agg(own_rows)),
+        riskmetrics.format_line(_net_returns(own_rows), "Risk-adj"),
         "_Win rate/P&L alone can't separate skill from luck — if the 95% CI "
         "straddles 0, there is no demonstrable edge yet._",
         "",

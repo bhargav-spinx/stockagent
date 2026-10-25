@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_DIR = Path(__file__).parent / "universe_snapshots"
 
 # ---------- NIFTY 50 ----------
+# Ticker renames reflected (verified against Angel's scrip master, same
+# tokens): TATAMOTORS→TMPV (demerger; passenger-vehicle entity keeps the
+# listing), ZOMATO→ETERNAL, LTIM→LTM, ICICIPRULI→ICICILIFE. Archived
+# candles under the OLD names are not merged into the new ones.
 NIFTY_50 = [
     "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
     "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL",
@@ -33,9 +37,9 @@ NIFTY_50 = [
     "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
     "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
     "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
-    "LTIM", "M&M", "MARUTI", "NESTLEIND", "NTPC",
+    "LTM", "M&M", "MARUTI", "NESTLEIND", "NTPC",
     "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-    "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
+    "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL",
     "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
 ]
 
@@ -45,11 +49,11 @@ NIFTY_NEXT_50 = [
     "BAJAJHLDNG", "BANKBARODA", "BERGEPAINT", "BOSCHLTD", "CANBK",
     "CGPOWER", "CHOLAFIN", "DABUR", "DIVISLAB", "DLF",
     "DMART", "GAIL", "GODREJCP", "HAL", "HAVELLS",
-    "HINDPETRO", "ICICIGI", "ICICIPRULI", "IOC", "INDIGO",
+    "HINDPETRO", "ICICIGI", "ICICILIFE", "IOC", "INDIGO",
     "IRFC", "JINDALSTEL", "JIOFIN", "LICI", "LODHA",
     "MOTHERSON", "NAUKRI", "PFC", "PIDILITIND", "PNB",
     "RECLTD", "SIEMENS", "SRF", "TATAPOWER", "TORNTPHARM",
-    "TVSMOTOR", "UNITDSPR", "VBL", "VEDL", "ZOMATO",
+    "TVSMOTOR", "UNITDSPR", "VBL", "VEDL", "ETERNAL",
     "ZYDUSLIFE", "INDHOTEL", "MARICO", "MUTHOOTFIN", "POLYCAB",
 ]
 
@@ -140,7 +144,7 @@ SWING_UNIVERSE = _ALL_NSE_EQUITIES or _STATIC_DEFAULT
 TIER1_WATCHLIST = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
     "KOTAKBANK", "INFY", "TCS", "LT", "BAJFINANCE",
-    "MARUTI", "TATAMOTORS", "ITC", "HINDUNILVR",
+    "MARUTI", "TMPV", "ITC", "HINDUNILVR",
 ]
 
 

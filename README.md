@@ -10,7 +10,7 @@ This is an **educational tool**. It is **not** SEBI-registered investment advice
 
 - **Swing analysis** (`/swing`) — daily candles, 4-indicator majority vote (SMA, RSI, MACD, Bollinger)
 - **Intraday analysis** (`/intraday`, `/score`) — 5-min candles; 100-point score across gap, relative volume, VWAP, EMA, ORB, volume breakout
-- **Setup scanner** (`/scan`) — ORB / VWAP / range setups from `STRATEGY.md`, with universal filters and quota-aware batch slicing
+- **Setup scanner** (`/scan`) — Setup A (opening-range breakout) from `STRATEGY.md`, with universal filters and quota-aware batch slicing. Setups B (VWAP pullback) and C (range reversal) are specified but **not implemented**
 - **Alert loops** — intraday auto-scan every 5 min (`/scan_alerts`), end-of-day swing calls at 15:45 IST (`/swing_alerts`), daily outcome report at 16:20 IST (`/eod_report`)
 - **Narrative reports** (`/report`) — deterministic institutional-style write-up, templated over engine output; no LLM/API involved
 - **Tip capture** — forward a message or paste a screenshot (OCR via Tesseract) and the bot extracts symbol/action/entry/SL/targets, logs it immutably, and re-analyzes it; a Telethon listener can also monitor public channels automatically
@@ -129,7 +129,7 @@ Final call = majority vote; confidence = % of indicators agreeing; at least 2 sa
 
 **Intraday** (`/intraday`) uses the same vote on 5-min candles; `/score` uses the separate 100-point engine (gap 20, relative volume 25, VWAP/EMA/ORB/volume-breakout components — see `intraday_score.py`).
 
-**Scanner** (`/scan`, scan alerts) detects the ORB / VWAP-reclaim / range setups defined in `STRATEGY.md`, behind universal filters (liquidity, spread, market trend), with quota-aware batch slicing and a circuit breaker for Angel One rate limits.
+**Scanner** (`/scan`) detects Setup A (ORB) as defined in `STRATEGY.md` (B/C are stubs), behind universal filters (liquidity, spread, market trend), with quota-aware batch slicing and a circuit breaker for Angel One rate limits.
 
 ## Evaluating performance honestly
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,7 +50,10 @@ def select_numeric_columns(feature_dicts: Sequence[dict],
     values: dict[str, set] = {}
     for f in feature_dicts:
         for k, v in (f or {}).items():
-            if k in skip or isinstance(v, str) or v is None:
+            # shadow_* = the model's OWN earlier output logged on live alerts;
+            # training on it would be a feedback loop, not a feature.
+            if (k in skip or k.startswith("shadow_") or isinstance(v, str)
+                    or v is None):
                 continue
             if isinstance(v, bool) or isinstance(v, (int, float)):
                 fv = float(v)
@@ -61,6 +65,110 @@ def select_numeric_columns(feature_dicts: Sequence[dict],
     n = len(feature_dicts)
     return sorted(k for k, c in counts.items()
                   if c / n >= min_coverage and len(values.get(k, set())) > 1)
+
+
+# ---------- model-input transform (versioned; shared by fit AND inference) ----
+#
+# v1 (2026-10). The first corrected (v2-label) fit put its largest weights on
+# artefacts of how the snapshot is laid out, not on setup quality:
+#   - RAW RUPEE LEVELS (price, swing high/low, S/R levels, ATR in ₹) are not
+#     comparable across a ₹50 and a ₹5,000 stock or across a split — `price`
+#     (−0.31) and `p3_pa_last_low` (+0.26) were a near-cancelling collinear
+#     pair fitting price bands. Their scale-free twins (atr_pct, risk_pct,
+#     dist_atr, dist_*_pct) stay.
+#   - bull_conviction / bear_conviction are exact complements and a monotone
+#     relabel of score × direction (bull = dp if long else 100 − dp), i.e. a
+#     hidden "is this a long" flag split across two columns.
+#   - DIRECTIONAL features were raw-signed while longs and shorts are pooled:
+#     "far above VWAP" is extension for a long but the wrong side for a short,
+#     and a linear model cannot learn that interaction. They are re-expressed
+#     relative to the TRADE (dir_* : + = favourable side), with an explicit
+#     is_long so any long/short drift is visible instead of smuggled in.
+# The version is stored in the artifact; artifacts without it (transform 0)
+# keep reading raw features exactly as before.
+FEATURE_TRANSFORM_VERSION = 1
+
+_RAW_LEVEL_KEYS = frozenset({
+    "price", "p3_pa_last_high", "p3_pa_last_low",
+    "p3_pa_nearest_support", "p3_pa_nearest_resistance", "p3_vol_atr",
+})
+_REDUNDANT_KEYS = frozenset({"bull_conviction", "bear_conviction"})
+# Continuous, sign-carrying features: multiplied by the trade sign.
+_SIGNED_CONTINUOUS = re.compile(
+    r"^(gap_pct|p3_vwap_dist_atr|p3_vwap_slope_pct|"
+    r"p3_rs_(rs|stock_ret|index_ret)_\d+)$")
+_DIRECTIONAL_OTHER = frozenset({
+    "p3_vwap_above", "p3_vwap_time_above_frac", "p3_vwap_reclaim",
+    "p3_vwap_failure", "p3_pa_hh", "p3_pa_hl", "p3_pa_lh", "p3_pa_ll",
+    "p3_pa_bos", "p3_pa_dist_support_pct", "p3_pa_dist_resistance_pct",
+})
+
+
+def _is_num(v) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and abs(v) != float("inf"))
+
+
+def _flag(v) -> int | None:
+    """Boolean-ish feature → 0/1; None stays None (missing ≠ False)."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    return int(bool(v)) if _is_num(v) else None
+
+
+def model_features(features: dict | None,
+                   version: int = FEATURE_TRANSFORM_VERSION) -> dict:
+    """Decision-time snapshot → model input (see the v1 rationale above).
+    Pure and total: never raises, never mutates the caller's dict."""
+    f = dict(features or {})
+    if version < 1:
+        return f
+    for k in _RAW_LEVEL_KEYS | _REDUNDANT_KEYS:
+        f.pop(k, None)
+    d = str(f.get("direction") or "").strip().lower()
+    sign = 1 if d in ("long", "buy") else -1 if d in ("short", "sell") else 0
+    directional = [k for k in f
+                   if _SIGNED_CONTINUOUS.match(k) or k in _DIRECTIONAL_OTHER]
+    raw = {k: f.pop(k) for k in directional}
+    if not sign:
+        return f          # can't orient them → drop, never mis-sign
+    long = sign > 0
+    f["is_long"] = long
+
+    for k, v in raw.items():
+        if _SIGNED_CONTINUOUS.match(k) and _is_num(v):
+            f[f"dir_{k}"] = v * sign
+
+    above = _flag(raw.get("p3_vwap_above"))
+    if above is not None:
+        f["dir_vwap_side"] = above if long else 1 - above
+    frac = raw.get("p3_vwap_time_above_frac")
+    if _is_num(frac):
+        f["dir_vwap_time_with"] = frac if long else 1.0 - frac
+    rec, fail = _flag(raw.get("p3_vwap_reclaim")), _flag(raw.get("p3_vwap_failure"))
+    if rec is not None and fail is not None:
+        f["dir_vwap_flip_with"] = rec if long else fail
+        f["dir_vwap_flip_against"] = fail if long else rec
+
+    hh, hl, lh, ll = (_flag(raw.get(f"p3_pa_{k}")) for k in ("hh", "hl", "lh", "ll"))
+    if None not in (hh, hl, lh, ll):
+        bull, bear = hh + hl, lh + ll
+        f["dir_pa_structure_with"] = bull if long else bear
+        f["dir_pa_structure_against"] = bear if long else bull
+    bos = raw.get("p3_pa_bos")
+    if isinstance(bos, str) and bos in ("bullish", "bearish"):
+        f["dir_pa_bos"] = 1 if (bos == "bullish") == long else -1
+    elif "p3_pa_bos" in raw:
+        f["dir_pa_bos"] = 0
+    ds, dr = raw.get("p3_pa_dist_support_pct"), raw.get("p3_pa_dist_resistance_pct")
+    room, backstop = (dr, ds) if long else (ds, dr)
+    if _is_num(room):
+        f["dir_pa_room_pct"] = room         # distance to the level in the way
+    if _is_num(backstop):
+        f["dir_pa_backstop_pct"] = backstop  # distance to the level behind
+    return f
 
 
 def extract_matrix(feature_dicts: Sequence[dict],
@@ -95,6 +203,9 @@ class LogisticModel:
     trained_at: str = ""
     converged: bool = False
     meta: dict = field(default_factory=dict)
+    # Model-input transform version (see model_features). 0 = raw snapshot
+    # features, the pre-2026-10 behaviour; loaded artifacts keep theirs.
+    transform: int = FEATURE_TRANSFORM_VERSION
 
     # ---------- fitting ----------
 
@@ -105,6 +216,7 @@ class LogisticModel:
         y_arr = np.asarray(list(y), dtype=float)
         if len(feature_dicts) != len(y_arr):
             raise ValueError("X/y length mismatch")
+        feature_dicts = [model_features(f, self.transform) for f in feature_dicts]
         if len(y_arr) == 0:
             raise ValueError("empty training set")
         self.columns = list(columns) if columns is not None else \
@@ -155,6 +267,7 @@ class LogisticModel:
     # ---------- inference ----------
 
     def _standardize_one(self, features: dict) -> np.ndarray:
+        features = model_features(features, self.transform)
         x = np.zeros(len(self.columns))
         for j, col in enumerate(self.columns):
             v = (features or {}).get(col)
@@ -197,6 +310,7 @@ class LogisticModel:
             "n_train": self.n_train,
             "trained_at": self.trained_at,
             "converged": self.converged,
+            "feature_transform": self.transform,
             "meta": self.meta,
         }
 
@@ -217,6 +331,7 @@ class LogisticModel:
         m.trained_at = d.get("trained_at", "")
         m.converged = bool(d.get("converged", False))
         m.meta = dict(d.get("meta", {}))
+        m.transform = int(d.get("feature_transform", 0))   # absent = legacy raw
         return m
 
     @classmethod

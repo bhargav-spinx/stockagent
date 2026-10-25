@@ -24,6 +24,14 @@ from constants import IST     # noqa: E402
 import engines.market_regime as mr        # noqa: E402
 
 CFG = RegimeConfig()   # pinned defaults, immune to $STOCKAGENT_CONFIG overrides
+# The expiry-mechanics tests below were written against a Thursday expiry;
+# pin that explicitly so they keep testing the holiday walk-back logic.
+CFG_THU = RegimeConfig(expiry_weekday=3)
+
+
+def test_default_expiry_is_tuesday():
+    # NSE moved NIFTY weekly expiry Thursday → Tuesday on 2025-09-01.
+    assert CFG.expiry_weekday == 1
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +255,7 @@ def test_now_garbage_degrades_to_clock(monkeypatch):
 def test_now_accepts_plain_date(monkeypatch):
     # A datetime.date is enough (we only need .date()-level precision).
     monkeypatch.setattr(market_calendar, "is_trading_holiday", lambda d: False)
-    res = mr.classify_regime(now=date(2026, 7, 9), cfg=CFG)   # Thursday expiry
+    res = mr.classify_regime(now=date(2026, 7, 9), cfg=CFG_THU)   # Thursday expiry
     assert res.values["expiry_day"] is True
     assert not any("now" in d for d in res.diagnostics)
 
@@ -259,31 +267,31 @@ def test_now_accepts_plain_date(monkeypatch):
 
 def test_expiry_normal_thursday(monkeypatch):
     monkeypatch.setattr(market_calendar, "is_trading_holiday", lambda d: False)
-    assert mr.is_expiry_day(date(2026, 7, 9), CFG) is True    # Thursday
-    assert mr.is_expiry_day(date(2026, 7, 8), CFG) is False   # Wednesday
-    assert mr.is_expiry_day(date(2026, 7, 10), CFG) is False  # Friday: past it
+    assert mr.is_expiry_day(date(2026, 7, 9), CFG_THU) is True    # Thursday
+    assert mr.is_expiry_day(date(2026, 7, 8), CFG_THU) is False   # Wednesday
+    assert mr.is_expiry_day(date(2026, 7, 10), CFG_THU) is False  # Friday: past it
 
 
 def test_expiry_shifts_back_on_holiday(monkeypatch):
     holidays = {date(2026, 7, 9)}                             # Thursday closed
     monkeypatch.setattr(market_calendar, "is_trading_holiday",
                         lambda d: d in holidays)
-    assert mr.is_expiry_day(date(2026, 7, 9), CFG) is False   # holiday itself
-    assert mr.is_expiry_day(date(2026, 7, 8), CFG) is True    # Wed takes it
+    assert mr.is_expiry_day(date(2026, 7, 9), CFG_THU) is False   # holiday itself
+    assert mr.is_expiry_day(date(2026, 7, 8), CFG_THU) is True    # Wed takes it
 
 
 def test_expiry_skips_holiday_run(monkeypatch):
     holidays = {date(2026, 7, 9), date(2026, 7, 8)}           # Thu + Wed closed
     monkeypatch.setattr(market_calendar, "is_trading_holiday",
                         lambda d: d in holidays)
-    assert mr.is_expiry_day(date(2026, 7, 7), CFG) is True    # Tuesday takes it
-    assert mr.is_expiry_day(date(2026, 7, 8), CFG) is False
+    assert mr.is_expiry_day(date(2026, 7, 7), CFG_THU) is True    # Tuesday takes it
+    assert mr.is_expiry_day(date(2026, 7, 8), CFG_THU) is False
 
 
 def test_classify_reports_expiry_flag(monkeypatch):
     monkeypatch.setattr(market_calendar, "is_trading_holiday", lambda d: False)
-    on = mr.classify_regime(now=IST.localize(datetime(2026, 7, 9, 10, 0)), cfg=CFG)
-    off = mr.classify_regime(now=IST.localize(datetime(2026, 7, 8, 10, 0)), cfg=CFG)
+    on = mr.classify_regime(now=IST.localize(datetime(2026, 7, 9, 10, 0)), cfg=CFG_THU)
+    off = mr.classify_regime(now=IST.localize(datetime(2026, 7, 8, 10, 0)), cfg=CFG_THU)
     assert on.values["expiry_day"] is True
     assert off.values["expiry_day"] is False
 

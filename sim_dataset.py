@@ -54,7 +54,7 @@ ssl_dev.install_if_enabled()
 import data_archive  # noqa: E402
 import eod_report  # noqa: E402
 import intraday_score  # noqa: E402
-from backtest import MIN_WARMUP_CANDLES  # noqa: E402  (single source)
+from backtest import BAR, LIVE_WINDOW_SESSIONS, MIN_WARMUP_CANDLES  # noqa: E402  (single source)
 from features import FEATURE_SCHEMA_VERSION, features_from_scorecard, phase3_features  # noqa: E402
 from scanner_filters import is_intraday_entry_window  # noqa: E402
 
@@ -62,7 +62,12 @@ logger = logging.getLogger(__name__)
 
 # Rows live next to the candles they were derived from (market_data.db is
 # already gitignored — research data never enters the repo).
-DATASET_VERSION = 1
+# v2 (2026-10): outcomes resolve from the trigger candle's CLOSE (v1 re-checked
+# the trigger candle itself — instant sl_hit on wide breakout bars), entry
+# window + time features use the decision time, gapped stops fill at the open,
+# post-T1 ambiguity books breakeven. v1 rows are NOT comparable: load_rows()
+# and dataset_stats() read the current version only — re-run `generate`.
+DATASET_VERSION = 2
 
 _PASS = eod_report.PASS_STATUSES
 _FAIL = eod_report.FAIL_STATUSES
@@ -115,8 +120,8 @@ def _daily_before(daily: pd.DataFrame, d) -> pd.DataFrame | None:
 # the scorer the same frame shape, or train/serve feature distributions drift
 # (a 23-prior-session RVOL baseline is a different variable than a 4-session
 # one). This window is also what makes generation fast: per-call cost is
-# bounded by ~5 sessions, not the whole archive.
-LIVE_WINDOW_SESSIONS = 5
+# bounded by ~5 sessions, not the whole archive. (LIVE_WINDOW_SESSIONS and
+# BAR are imported from backtest.py — one definition for both replays.)
 
 
 def generate_symbol(symbol: str, *, min_score: int = 60,
@@ -151,7 +156,8 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
             if j + 1 <= MIN_WARMUP_CANDLES:
                 continue
             ts = window.index[j].to_pydatetime()
-            if not is_intraday_entry_window(ts):
+            decided_at = ts + BAR          # actionable at the candle CLOSE (see backtest.BAR)
+            if not is_intraday_entry_window(decided_at):
                 continue
             slice_df = window.iloc[: j + 1]
             try:
@@ -176,13 +182,13 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
             alert = {"symbol": symbol, "entry": card.entry,
                      "stop_loss": card.stop_loss, "target1": card.target1,
                      "target2": card.target2, "direction": card.direction,
-                     "generated_at": ts}
+                     "generated_at": decided_at}
             outcome = eod_report.resolve_intraday(alert, df=window)
             status = (outcome or {}).get("status")
             if status in (None, "open", "no_data"):
                 break
 
-            feats = features_from_scorecard(card, now=ts)
+            feats = features_from_scorecard(card, now=decided_at)
             idx_slice = (index_df[index_df.index <= window.index[j]]
                          if index_df is not None and len(index_df) else None)
             feats.update(phase3_features(slice_df, index_df=idx_slice))
@@ -213,16 +219,30 @@ def generate_symbol(symbol: str, *, min_score: int = 60,
     return len(rows)
 
 
+def _load_nifty_5m() -> pd.DataFrame | None:
+    """NIFTY 5-min candles from the archive under EITHER key. The live bot
+    archives index_trend's fetch as "NIFTY" (the alias), but the backfill CLI
+    normalises symbols first and stores "^NSEI" — reading only "NIFTY" meant a
+    backfilled index was never found. Frames are merged; duplicates dropped."""
+    frames = [f for f in (data_archive.load(k, "5m") for k in ("NIFTY", "^NSEI"))
+              if len(f)]
+    if not frames:
+        return None
+    df = pd.concat(frames).sort_index()
+    return df[~df.index.duplicated(keep="last")]
+
+
 def generate(symbols: Iterable[str], *, min_score: int = 60,
              days: int | None = None, run_id: str | None = None) -> dict:
     """Generate over many symbols. The NIFTY frame (if archived) feeds the
     relative-strength features, sliced point-in-time per decision candle."""
     _init_table()
     run_id = run_id or datetime.now().strftime("run-%Y%m%d-%H%M%S")
-    index_df = data_archive.load("NIFTY", "5m")
-    if len(index_df) == 0:
-        index_df = None
-        logger.info("no archived NIFTY 5m — relative-strength features omitted")
+    index_df = _load_nifty_5m()
+    if index_df is None:
+        logger.info("no archived NIFTY 5m — relative-strength features omitted "
+                    "(seed it: python data_archive.py backfill --symbols NIFTY "
+                    "--days 60)")
     total, per_symbol = 0, {}
     symbols = list(symbols)
     t0 = time.monotonic()
@@ -239,12 +259,19 @@ def generate(symbols: Iterable[str], *, min_score: int = 60,
 
 
 def load_rows(min_score: int | None = None,
-              decisive_only: bool = False) -> list[dict[str, Any]]:
+              decisive_only: bool = False,
+              version: int | None = DATASET_VERSION) -> list[dict[str, Any]]:
     """Training rows, oldest-first (time order matters for purged CV).
-    features come back parsed."""
+    features come back parsed. Only rows of `version` (default: current
+    DATASET_VERSION) — older generations used different labelling rules and
+    must never be pooled with current ones. version=None reads everything."""
     _init_table()
     sql = "SELECT * FROM sim_trades"
     clauses, params = [], []
+    if version is not None:
+        clauses.append("dataset_v = ?")
+        params.append(version)
+        _warn_stale_versions(version)
     if min_score is not None:
         clauses.append("score >= ?")
         params.append(min_score)
@@ -264,21 +291,42 @@ def load_rows(min_score: int | None = None,
     return rows
 
 
-def dataset_stats() -> dict:
+def _warn_stale_versions(version: int) -> None:
+    with data_archive._conn() as c:
+        stale = c.execute("SELECT count(*) FROM sim_trades WHERE dataset_v IS NOT ?",
+                          (version,)).fetchone()[0]
+    if stale:
+        logger.warning("sim_trades holds %d row(s) from an older dataset version "
+                       "(excluded) — re-run `sim_dataset.py generate` to rebuild "
+                       "them under v%d", stale, version)
+
+
+def dataset_stats(version: int | None = DATASET_VERSION) -> dict:
     _init_table()
+    where, params = ("WHERE dataset_v = ?", (version,)) if version is not None else ("", ())
+    if version is not None:
+        _warn_stale_versions(version)
     with data_archive._conn() as c:
         n, wins, decisive = c.execute(
             "SELECT count(*), coalesce(sum(label_win),0), "
-            "coalesce(sum(label_decisive),0) FROM sim_trades").fetchone()
+            f"coalesce(sum(label_decisive),0) FROM sim_trades {where}", params).fetchone()
         span = c.execute(
-            "SELECT min(trade_date), max(trade_date) FROM sim_trades").fetchone()
+            f"SELECT min(trade_date), max(trade_date) FROM sim_trades {where}",
+            params).fetchone()
         by_bucket = c.execute(
             "SELECT CASE WHEN score>=90 THEN '90+' WHEN score>=80 THEN '80-89' "
             "WHEN score>=70 THEN '70-79' ELSE '60-69' END b, count(*), "
-            "coalesce(sum(label_win),0) FROM sim_trades GROUP BY b ORDER BY b"
-        ).fetchall()
+            f"coalesce(sum(label_win),0) FROM sim_trades {where} GROUP BY b ORDER BY b",
+            params).fetchall()
+        # Coverage by month: a min→max date range hides holes and windows
+        # where only a few symbols were archived.
+        by_month = c.execute(
+            "SELECT substr(trade_date,1,7) m, count(*), count(DISTINCT symbol), "
+            f"count(DISTINCT trade_date) FROM sim_trades {where} GROUP BY m ORDER BY m",
+            params).fetchall()
     return {"rows": n, "wins": wins, "decisive": decisive,
-            "date_range": span, "by_score_bucket": by_bucket}
+            "date_range": span, "by_score_bucket": by_bucket,
+            "by_month": by_month, "dataset_version": version}
 
 
 def _cli() -> None:
@@ -308,6 +356,9 @@ def _cli() -> None:
         for b, n, w in s["by_score_bucket"]:
             wr = (w / n * 100) if n else 0.0
             print(f"  score {b:>6}: n={n:<6} win {wr:.0f}% (sim-optimistic)")
+        print("  coverage by month (rows · symbols · sessions):")
+        for m, n, nsym, ndays in s["by_month"]:
+            print(f"    {m}: {n:<5} rows · {nsym:<3} symbols · {ndays} sessions")
         return
 
     from analyzer import normalize_symbol
